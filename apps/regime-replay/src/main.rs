@@ -1,7 +1,8 @@
 use anyhow::{Context, bail};
 use regime_core::{
-    AlertRecord, PricePoint, ShiftLabel, ShiftLabelConfig, ValidationReport, generate_shift_labels,
-    validate_alerts,
+    AlertRecord, FeatureWindowRecord, PricePoint, ScoreThresholds, ScoreWeights, ShiftLabel,
+    ShiftLabelConfig, ValidationReport, generate_alerts_from_feature_windows,
+    generate_shift_labels, validate_alerts,
 };
 use serde::{Deserialize, Serialize};
 use std::{env, fs, path::PathBuf};
@@ -9,13 +10,20 @@ use std::{env, fs, path::PathBuf};
 #[derive(Debug, Deserialize)]
 struct ReplayInput {
     price_points: Vec<PricePoint>,
+    #[serde(default)]
     alerts: Vec<AlertRecord>,
+    #[serde(default)]
+    feature_windows: Vec<FeatureWindowRecord>,
+    score_weights: Option<ScoreWeights>,
+    score_thresholds: Option<ScoreThresholds>,
+    alert_horizon_ms: Option<i64>,
     label_config: ShiftLabelConfig,
     synchronous_tolerance_ms: i64,
 }
 
 #[derive(Debug, Serialize)]
 struct ReplayOutput {
+    alerts: Vec<AlertRecord>,
     labels: Vec<ShiftLabel>,
     report: ValidationReport,
 }
@@ -35,9 +43,14 @@ struct CliArgs {
 fn main() -> anyhow::Result<()> {
     let args = parse_args(env::args().skip(1))?;
     let input = read_replay_input(&args.input_path)?;
+    let alerts = replay_alerts(&input)?;
     let labels = generate_shift_labels(&input.price_points, &input.label_config);
-    let report = validate_alerts(&input.alerts, &labels, input.synchronous_tolerance_ms);
-    let output = ReplayOutput { labels, report };
+    let report = validate_alerts(&alerts, &labels, input.synchronous_tolerance_ms);
+    let output = ReplayOutput {
+        alerts,
+        labels,
+        report,
+    };
 
     match args.format {
         OutputFormat::Json => println!("{}", serde_json::to_string(&output)?),
@@ -45,6 +58,33 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn replay_alerts(input: &ReplayInput) -> anyhow::Result<Vec<AlertRecord>> {
+    if !input.alerts.is_empty() {
+        return Ok(input.alerts.clone());
+    }
+
+    if input.feature_windows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let Some(weights) = input.score_weights else {
+        bail!("score_weights are required when feature_windows are provided without alerts");
+    };
+    let Some(thresholds) = input.score_thresholds else {
+        bail!("score_thresholds are required when feature_windows are provided without alerts");
+    };
+    let Some(horizon_ms) = input.alert_horizon_ms else {
+        bail!("alert_horizon_ms is required when feature_windows are provided without alerts");
+    };
+
+    Ok(generate_alerts_from_feature_windows(
+        &input.feature_windows,
+        &weights,
+        &thresholds,
+        horizon_ms,
+    ))
 }
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> anyhow::Result<CliArgs> {
