@@ -120,6 +120,53 @@ pub mod mongo_indexes {
     }
 }
 
+pub mod similar_windows {
+    use mongodb::bson::{Bson, Document, doc};
+    use regime_core::vector_search_specs;
+
+    pub fn similar_windows_pipeline(slug: &str, query_vector: &[f64], limit: u32) -> Vec<Document> {
+        let spec = vector_search_specs()[0];
+        let query_vector = query_vector
+            .iter()
+            .copied()
+            .map(Bson::Double)
+            .collect::<Vec<_>>();
+
+        vec![
+            doc! {
+                "$vectorSearch": {
+                    "index": spec.name,
+                    "path": spec.path,
+                    "queryVector": query_vector,
+                    "numCandidates": (limit * 20) as i32,
+                    "limit": limit as i32,
+                    "filter": {
+                        "slug": slug,
+                    },
+                },
+            },
+            doc! {
+                "$project": {
+                    "_id": 0,
+                    "slug": 1,
+                    "window_ts": 1,
+                    "window_ms": 1,
+                    "p_mid": 1,
+                    "p_fair": 1,
+                    "fair_gap": 1,
+                    "ofi_1s": 1,
+                    "depth_imbalance": 1,
+                    "spread": 1,
+                    "volume_acceleration": 1,
+                    "score": {
+                        "$meta": "vectorSearchScore",
+                    },
+                },
+            },
+        ]
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     status: &'static str,
