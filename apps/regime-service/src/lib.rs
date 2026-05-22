@@ -282,6 +282,34 @@ pub mod mongo_bootstrap {
     }
 }
 
+pub mod mongo_documents {
+    use mongodb::bson::{Bson, DateTime, Document, doc};
+    use regime_core::FeatureWindowRecord;
+
+    pub fn feature_window_document(window: &FeatureWindowRecord) -> Document {
+        let feature_vector = window
+            .feature_vector
+            .iter()
+            .copied()
+            .map(Bson::Double)
+            .collect::<Vec<_>>();
+
+        doc! {
+            "slug": &window.slug,
+            "window_ts": DateTime::from_millis(window.window_ts_ms),
+            "window_ms": window.window_ms as i32,
+            "p_mid": window.p_mid,
+            "p_fair": window.p_fair,
+            "fair_gap": window.fair_gap,
+            "ofi_1s": window.ofi_1s,
+            "depth_imbalance": window.depth_imbalance,
+            "spread": window.spread,
+            "volume_acceleration": window.volume_acceleration,
+            "feature_vector": feature_vector,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     status: &'static str,
