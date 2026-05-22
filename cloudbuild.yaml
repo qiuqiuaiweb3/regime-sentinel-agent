@@ -1,0 +1,45 @@
+substitutions:
+  _REGION: asia-northeast1
+  _SERVICE: regime-sentinel-agent
+  _REPOSITORY: regime-sentinel
+  _IMAGE: regime-service
+
+steps:
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    args:
+      - -lc
+      - |
+        gcloud artifacts repositories describe "$_REPOSITORY" \
+          --location="$_REGION" >/dev/null 2>&1 \
+        || gcloud artifacts repositories create "$_REPOSITORY" \
+          --repository-format=docker \
+          --location="$_REGION"
+
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE}:$SHORT_SHA
+      - .
+
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE}:$SHORT_SHA
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICE}
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE}:$SHORT_SHA
+      - --region=${_REGION}
+      - --platform=managed
+      - --allow-unauthenticated
+      - --set-env-vars=GOOGLE_CLOUD_PROJECT=$PROJECT_ID,GOOGLE_CLOUD_REGION=${_REGION},LIVE_COLLECTOR_ENABLED=false,GEMINI_ENABLED=false,REGIME_STATIC_DIR=/app/build
+      - --set-secrets=MONGODB_URI=mongodb-uri:latest,MONGODB_DB=mongodb-db:latest
+
+images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE}:$SHORT_SHA

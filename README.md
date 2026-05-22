@@ -20,6 +20,9 @@ Current implementation status:
 - MongoDB collection/index bootstrap is available through an explicit CLI.
 - MongoDB document writers exist for market ticks, feature windows, regime states, alerts,
   agent summaries, and backtest runs.
+- Axum serves the SvelteKit dashboard, REST API, SSE stream, and OpenAPI tool spec.
+- Live collector code supports Polymarket CLOB market data, Coinbase BTC reference prices,
+  stale-data downgrade, and NDJSON fallback.
 - Gemini calls are disabled by default and cost-limited when enabled.
 
 ## Architecture
@@ -32,8 +35,12 @@ Current implementation status:
 
 ```bash
 cp .env.example .env
+npm ci
+npm run build
 cargo build
 cargo test
+npm test -- --run
+npm run check
 ```
 
 Do not commit `.env` or local secret files.
@@ -56,6 +63,77 @@ Required later for live/cloud runs:
 - `GEMINI_SUMMARY_INTERVAL_MINUTES`
 - `GEMINI_MAX_CALLS_PER_HOUR`
 
+Gemini is intentionally disabled by default. To enable summaries, set:
+
+```bash
+GEMINI_ENABLED=true
+GEMINI_API_KEY=...
+GEMINI_SUMMARY_INTERVAL_MINUTES=30
+GEMINI_MAX_CALLS_PER_HOUR=2
+```
+
+Live collector is intentionally disabled by default. To enable it for one market:
+
+```bash
+LIVE_COLLECTOR_ENABLED=true
+LIVE_MARKET_SLUG=btc-updown-5m-...
+LIVE_MARKET_SERIES=btc-updown-5m
+POLYMARKET_ASSET_IDS=yes-token-id,no-token-id
+POLYMARKET_OUTCOMES=UP,DOWN
+REFERENCE_PRICE_PRODUCT_ID=BTC-USD
+```
+
+## Run Locally
+
+Serve the production dashboard through Axum:
+
+```bash
+npm run build
+REGIME_STATIC_DIR=build cargo run -p regime-service --bin regime-service
+```
+
+Useful local endpoints:
+
+- `http://127.0.0.1:8080/`
+- `http://127.0.0.1:8080/health`
+- `http://127.0.0.1:8080/api/dashboard/snapshot`
+- `http://127.0.0.1:8080/api/dashboard/events`
+- `http://127.0.0.1:8080/api/openapi.json`
+
+## Google Cloud Run
+
+The deployment target is Tokyo:
+
+```bash
+gcloud config set project poly-market-analysis
+gcloud builds submit --config cloudbuild.yaml
+```
+
+The Cloud Build file creates an Artifact Registry Docker repository in
+`asia-northeast1`, builds the SvelteKit static frontend and Rust service image,
+pushes the image, and deploys Cloud Run with `LIVE_COLLECTOR_ENABLED=false` and
+`GEMINI_ENABLED=false`.
+
+Expected existing Secret Manager secrets:
+
+- `mongodb-uri`
+- `mongodb-db`
+
+Optional Gemini secret/env can be added later after a real API key is available:
+
+```bash
+gcloud run services update regime-sentinel-agent \
+  --region asia-northeast1 \
+  --set-env-vars GEMINI_ENABLED=true,GEMINI_SUMMARY_INTERVAL_MINUTES=30,GEMINI_MAX_CALLS_PER_HOUR=2 \
+  --set-secrets GEMINI_API_KEY=gemini-api-key:latest
+```
+
+## Agent Builder
+
+Use the hosted Cloud Run URL plus `/api/openapi.json` as the OpenAPI tool source.
+The OpenAPI spec exposes read/demo-safe operations for health, dashboard snapshot,
+and replay validation.
+
 ## Validation Gates
 
 The project is accepted only when these gates are backed by artifacts:
@@ -66,6 +144,8 @@ The project is accepted only when these gates are backed by artifacts:
 - Replay mode can reproduce a fixed high-volatility window.
 - At least one replay alert has `alert_time < shift_onset_time`.
 - Validation report includes lead time, false alerts, precision, recall, horizon PR-AUC, and ablation.
+
+See `docs/acceptance.md` for the current gate status and known external blockers.
 
 ## License
 
