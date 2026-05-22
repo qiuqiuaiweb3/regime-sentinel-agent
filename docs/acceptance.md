@@ -1,9 +1,9 @@
 # Acceptance Gates
 
-This file records what can be verified locally now and what still requires hosted
-infrastructure or external network access.
+This file records what has been verified locally and what was verified through
+hosted Google Cloud infrastructure.
 
-## Implemented And Locally Verified
+## Implemented And Verified
 
 - Rust hot-path core: alert scoring, shift labels, feature windows, replay validation.
 - MongoDB schema/index specs and Atlas bootstrap CLI.
@@ -47,6 +47,24 @@ infrastructure or external network access.
 - Cloud Run resource config is explicit in `cloudbuild.yaml`: `asia-northeast1`,
   `1` vCPU, `1Gi` memory, min `1`, max `1`, concurrency `80`, timeout `3600s`,
   service account, and Secret Manager injection.
+- Cloud Run deployment was verified on 2026-05-23 JST:
+  - build id: `0c039eb6-22dd-4dd5-9d3b-ab8a0b4121c3`
+  - revision: `regime-sentinel-agent-00006-kcs`
+  - image:
+    `asia-northeast1-docker.pkg.dev/poly-market-analysis/regime-sentinel/regime-service:0c039eb6-22dd-4dd5-9d3b-ab8a0b4121c3`
+  - `/health` returned `{"status":"ok","service":"regime-service"}`.
+  - `/api/openapi.json` returned OpenAPI `3.0.3`, the hosted Cloud Run server URL,
+    and a JSON request schema for `POST /api/replay/validate`.
+- Agent Builder / Conversational Agents was configured on 2026-05-23 JST:
+  - Dialogflow API: enabled for `poly-market-analysis`.
+  - agent:
+    `projects/poly-market-analysis/locations/asia-northeast1/agents/3e5926c5-ed12-40de-a944-b66fae7fe1e0`
+  - OpenAPI tool:
+    `projects/poly-market-analysis/locations/asia-northeast1/agents/3e5926c5-ed12-40de-a944-b66fae7fe1e0/tools/83dd74d9-d114-433d-b46d-6dd4a055bc48`
+  - playbook:
+    `projects/poly-market-analysis/locations/asia-northeast1/agents/3e5926c5-ed12-40de-a944-b66fae7fe1e0/playbooks/c186ebd4-adcb-4ea6-b400-893768e30ff4`
+  - The playbook references the Regime Sentinel Dashboard API tool and instructs
+    it to call `getDashboardSnapshot` before summarizing current regime state.
 - GCP-network Polymarket discovery smoke was verified on 2026-05-23 JST through
   Cloud Build:
   - Gamma API returned live BTC 5m slugs including `btc-updown-5m-1779474300`,
@@ -54,6 +72,18 @@ infrastructure or external network access.
   - The corresponding event payloads included CLOB token ids for `Up` and `Down`.
   - Direct local `curl` from this workstation still cannot connect to Polymarket
     domains, so live tests must run from GCP or another network.
+- Three-window live Polymarket smoke was verified on 2026-05-23 JST through
+  Cloud Build:
+  - build id: `e5936042-2ad1-4afc-8a19-4fcbcf445cb4`
+  - artifact prefix:
+    `gs://poly-market-analysis_cloudbuild/live-smoke/e5936042-2ad1-4afc-8a19-4fcbcf445cb4/`
+  - `summary.json` had `passed: true`.
+  - Windows:
+    - `btc-updown-5m-1779477300`: `market_ticks=48`, `reference_ticks=168`.
+    - `btc-updown-5m-1779477600`: `market_ticks=39937`, `reference_ticks=205`.
+    - `btc-updown-5m-1779477900`: `market_ticks=190`, `reference_ticks=149`.
+  - Each smoke ran for `30` seconds and observed `BTC-USD`, `UP`, and `DOWN`
+    outcomes.
 
 ## Verification Commands
 
@@ -73,15 +103,14 @@ GEMINI_ENABLED=true GEMINI_PROVIDER=vertex GEMINI_LOCATION=global \
   GEMINI_MODEL=gemini-3-flash-preview \
   GEMINI_ACCESS_TOKEN="$(gcloud auth print-access-token)" \
   cargo run -p regime-service --bin gemini_summary_once
+gcloud builds submit --config cloudbuild.live-smoke.yaml
 ```
 
 ## External Gates Not Yet Closed
 
-- Agent Builder configured in Google Cloud with `/api/openapi.json` as an OpenAPI tool.
-- Live Polymarket smoke test for three real 5 minute market windows.
 - Final demo video and Devpost submission.
 
 Current local blocker: this machine cannot connect to `docs.polymarket.com`,
 `clob.polymarket.com`, or `gamma-api.polymarket.com` with `curl`; GCP network
-connectivity has been verified, but the full three-window collector smoke still
-needs to run from GCP or another network.
+connectivity has been verified and the full three-window collector smoke passed
+from Cloud Build.

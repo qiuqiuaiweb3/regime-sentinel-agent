@@ -222,9 +222,45 @@ gcloud run services update regime-sentinel-agent \
 
 ## Agent Builder
 
-Use the hosted Cloud Run URL plus `/api/openapi.json` as the OpenAPI tool source.
-The OpenAPI spec exposes read/demo-safe operations for health, dashboard snapshot,
-and replay validation.
+The deployed OpenAPI spec is served from:
+
+```text
+https://regime-sentinel-agent-998092298764.asia-northeast1.run.app/api/openapi.json
+```
+
+It exposes read/demo-safe operations for health, dashboard snapshot, and replay
+validation. The hosted spec uses OpenAPI `3.0.3`, includes the Cloud Run server
+URL, and declares the replay validation JSON request body.
+
+Configured Google Cloud resources:
+
+- agent:
+  `projects/poly-market-analysis/locations/asia-northeast1/agents/3e5926c5-ed12-40de-a944-b66fae7fe1e0`
+- OpenAPI tool:
+  `projects/poly-market-analysis/locations/asia-northeast1/agents/3e5926c5-ed12-40de-a944-b66fae7fe1e0/tools/83dd74d9-d114-433d-b46d-6dd4a055bc48`
+- playbook:
+  `projects/poly-market-analysis/locations/asia-northeast1/agents/3e5926c5-ed12-40de-a944-b66fae7fe1e0/playbooks/c186ebd4-adcb-4ea6-b400-893768e30ff4`
+
+## Live Smoke
+
+Run the GCP-network live smoke from Cloud Build:
+
+```bash
+gcloud builds submit --config cloudbuild.live-smoke.yaml
+```
+
+The smoke discovers three current `btc-updown-5m-{epoch}` events, subscribes to
+their Polymarket CLOB market streams plus Coinbase `BTC-USD`, and writes JSON
+artifacts to `gs://poly-market-analysis_cloudbuild/live-smoke/$BUILD_ID/`.
+
+Latest passing run:
+
+- build id: `e5936042-2ad1-4afc-8a19-4fcbcf445cb4`
+- artifact prefix:
+  `gs://poly-market-analysis_cloudbuild/live-smoke/e5936042-2ad1-4afc-8a19-4fcbcf445cb4/`
+- windows: `btc-updown-5m-1779477300`, `btc-updown-5m-1779477600`,
+  `btc-updown-5m-1779477900`
+- result: `summary.json` had `passed: true`
 
 ## Validation Gates
 
@@ -232,7 +268,8 @@ The project is accepted only when these gates are backed by artifacts:
 
 - Hosted web app is reachable.
 - MongoDB Atlas collections are written and queryable.
-- Agent Builder and Gemini are actually used for summaries.
+- Agent Builder is configured with the hosted OpenAPI tool and playbook.
+- Gemini is actually used for summaries.
 - Replay mode can reproduce a fixed high-volatility window.
 - At least one replay alert has `alert_time < shift_onset_time`.
 - Validation report includes lead time, false alerts, precision, recall, horizon PR-AUC, and ablation.
