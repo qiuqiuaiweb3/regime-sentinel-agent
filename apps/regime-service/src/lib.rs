@@ -647,6 +647,290 @@ pub mod gemini_throttle {
     }
 }
 
+pub mod gemini_summary {
+    use crate::gemini_throttle::GeminiThrottleConfig;
+    use anyhow::{Context, anyhow};
+    use regime_core::{AgentSummaryRecord, RegimeStateRecord};
+    use serde_json::{Value, json};
+    use std::path::Path;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    pub const DEFAULT_GEMINI_ENDPOINT_BASE: &str =
+        "https://generativelanguage.googleapis.com/v1beta";
+    pub const DEFAULT_GEMINI_MODEL: &str = "gemini-3-pro-preview";
+    pub const DEFAULT_GEMINI_THINKING_LEVEL: &str = "low";
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct GeminiSummaryConfig {
+        pub throttle: GeminiThrottleConfig,
+        pub api_key: Option<String>,
+        pub model: String,
+        pub endpoint_base: String,
+        pub thinking_level: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct GeminiGenerateRequest {
+        pub url: String,
+        pub api_key: String,
+        pub body: Value,
+    }
+
+    impl GeminiSummaryConfig {
+        pub fn from_env_values(
+            enabled: Option<&str>,
+            summary_interval_minutes: Option<&str>,
+            max_calls_per_hour: Option<&str>,
+            api_key: Option<&str>,
+            model: Option<&str>,
+            endpoint_base: Option<&str>,
+        ) -> Result<Self, String> {
+            Ok(Self {
+                throttle: GeminiThrottleConfig::from_env_values(
+                    enabled,
+                    summary_interval_minutes,
+                    max_calls_per_hour,
+                )?,
+                api_key: api_key.map(str::to_string),
+                model: model.unwrap_or(DEFAULT_GEMINI_MODEL).to_string(),
+                endpoint_base: endpoint_base
+                    .unwrap_or(DEFAULT_GEMINI_ENDPOINT_BASE)
+                    .trim_end_matches('/')
+                    .to_string(),
+                thinking_level: DEFAULT_GEMINI_THINKING_LEVEL.to_string(),
+            })
+        }
+
+        pub fn from_env() -> Result<Self, String> {
+            Self::from_env_values(
+                std::env::var("GEMINI_ENABLED").ok().as_deref(),
+                std::env::var("GEMINI_SUMMARY_INTERVAL_MINUTES")
+                    .ok()
+                    .as_deref(),
+                std::env::var("GEMINI_MAX_CALLS_PER_HOUR").ok().as_deref(),
+                std::env::var("GEMINI_API_KEY").ok().as_deref(),
+                std::env::var("GEMINI_MODEL").ok().as_deref(),
+                std::env::var("GEMINI_ENDPOINT_BASE").ok().as_deref(),
+            )
+        }
+    }
+
+    pub fn build_gemini_request(
+        config: &GeminiSummaryConfig,
+        prompt: &str,
+    ) -> Result<GeminiGenerateRequest, String> {
+        let api_key = config.api_key.clone().ok_or_else(|| {
+            "GEMINI_API_KEY is required when Gemini summaries are enabled".to_string()
+        })?;
+        Ok(GeminiGenerateRequest {
+            url: format!(
+                "{}/models/{}:generateContent",
+                config.endpoint_base, config.model
+            ),
+            api_key,
+            body: json!({
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [
+                            { "text": prompt }
+                        ]
+                    }
+                ],
+                "generationConfig": {
+                    "temperature": 0.2,
+                    "maxOutputTokens": 256
+                }
+            }),
+        })
+    }
+
+    pub fn build_summary_prompt(state: &RegimeStateRecord, recent_alert_count: usize) -> String {
+        format!(
+            "Summarize the current prediction-market regime for a hackathon dashboard in 3 short bullet points. State: {}. Previous state: {}. Confidence: {:.2}. Market resolved: {}. There are {} recent alerts. Indicators JSON: {}. Do not suggest trades or position sizing.",
+            state.regime,
+            state.previous_regime,
+            state.confidence,
+            state.market_resolved,
+            recent_alert_count,
+            state.indicators
+        )
+    }
+
+    pub fn parse_gemini_text(value: &Value) -> Result<String, String> {
+        value
+            .get("candidates")
+            .and_then(Value::as_array)
+            .and_then(|candidates| candidates.first())
+            .and_then(|candidate| candidate.get("content"))
+            .and_then(|content| content.get("parts"))
+            .and_then(Value::as_array)
+            .and_then(|parts| parts.first())
+            .and_then(|part| part.get("text"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| {
+                "Gemini response did not include candidates[0].content.parts[0].text".to_string()
+            })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn summary_record(
+        bucket_start_ms: i64,
+        bucket_seconds: i64,
+        model: &str,
+        thinking_level: &str,
+        summary: &str,
+        alert_ids: Vec<String>,
+        similar_window_ids: Vec<String>,
+        token_usage: Value,
+    ) -> AgentSummaryRecord {
+        AgentSummaryRecord {
+            bucket_start_ms,
+            bucket_seconds,
+            model: model.to_string(),
+            thinking_level: thinking_level.to_string(),
+            summary: summary.to_string(),
+            alert_ids,
+            similar_window_ids,
+            token_usage,
+        }
+    }
+
+    pub async fn request_gemini_summary(
+        client: &reqwest::Client,
+        config: &GeminiSummaryConfig,
+        prompt: &str,
+    ) -> anyhow::Result<String> {
+        let request = build_gemini_request(config, prompt).map_err(anyhow::Error::msg)?;
+        let response = client
+            .post(&request.url)
+            .header("x-goog-api-key", request.api_key)
+            .json(&request.body)
+            .send()
+            .await
+            .context("send Gemini generateContent request")?;
+        let status = response.status();
+        let body = response
+            .json::<Value>()
+            .await
+            .context("decode Gemini generateContent response")?;
+        if !status.is_success() {
+            return Err(anyhow!(
+                "Gemini generateContent failed with {status}: {body}"
+            ));
+        }
+        parse_gemini_text(&body).map_err(anyhow::Error::msg)
+    }
+
+    pub async fn persist_agent_summary_or_fallback(
+        store: Option<&crate::mongo_store::MongoStore>,
+        summary: &AgentSummaryRecord,
+        fallback_path: &Path,
+    ) -> anyhow::Result<()> {
+        let Some(store) = store else {
+            return crate::live_collector::append_ndjson_fallback(
+                fallback_path,
+                "agent_summary",
+                summary,
+            );
+        };
+
+        if let Err(error) = store.insert_agent_summary(summary).await {
+            tracing::warn!(
+                ?error,
+                "agent summary MongoDB write failed; using NDJSON fallback"
+            );
+            crate::live_collector::append_ndjson_fallback(fallback_path, "agent_summary", summary)?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn run_gemini_summary_scheduler(
+        config: GeminiSummaryConfig,
+        store: Option<crate::mongo_store::MongoStore>,
+        fallback_path: impl AsRef<Path>,
+    ) -> anyhow::Result<()> {
+        if !config.throttle.enabled {
+            return Ok(());
+        }
+        if config.api_key.is_none() {
+            tracing::warn!(
+                "Gemini summaries enabled without GEMINI_API_KEY; scheduler not started"
+            );
+            return Ok(());
+        }
+
+        let client = reqwest::Client::new();
+        let fallback_path = fallback_path.as_ref().to_path_buf();
+        let bucket_seconds = (config.throttle.summary_interval_minutes * 60) as i64;
+        let mut last_summary_at_ms = Some(unix_timestamp_ms());
+        let mut calls_started_at_ms = Vec::new();
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+
+        loop {
+            interval.tick().await;
+            let now_ms = unix_timestamp_ms();
+            calls_started_at_ms.retain(|started_at_ms| now_ms - *started_at_ms < 3_600_000);
+            if !config.throttle.should_start_summary(
+                now_ms,
+                last_summary_at_ms,
+                calls_started_at_ms.len() as u32,
+            ) {
+                continue;
+            }
+
+            let state = scheduler_snapshot_state(now_ms);
+            let prompt = build_summary_prompt(&state, 0);
+            calls_started_at_ms.push(now_ms);
+            match request_gemini_summary(&client, &config, &prompt).await {
+                Ok(summary) => {
+                    let record = summary_record(
+                        now_ms - (now_ms % (bucket_seconds * 1_000)),
+                        bucket_seconds,
+                        &config.model,
+                        &config.thinking_level,
+                        &summary,
+                        Vec::new(),
+                        Vec::new(),
+                        json!({ "estimated": true }),
+                    );
+                    persist_agent_summary_or_fallback(store.as_ref(), &record, &fallback_path)
+                        .await?;
+                    last_summary_at_ms = Some(now_ms);
+                }
+                Err(error) => {
+                    tracing::warn!(?error, "Gemini summary request failed");
+                }
+            }
+        }
+    }
+
+    fn scheduler_snapshot_state(now_ms: i64) -> RegimeStateRecord {
+        RegimeStateRecord {
+            id: "dashboard-snapshot".to_string(),
+            regime: "EARLY_RISK".to_string(),
+            confidence: 0.72,
+            updated_at_ms: now_ms,
+            previous_regime: "WATCH".to_string(),
+            indicators: json!({
+                "source": "scheduler_snapshot",
+                "fair_gap": 0.03,
+                "ofi_1s": 0.42
+            }),
+            market_resolved: false,
+        }
+    }
+
+    fn unix_timestamp_ms() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64
+    }
+}
+
 pub mod live_collector {
     use anyhow::Context;
     use chrono::DateTime;
@@ -1435,6 +1719,7 @@ pub fn build_router_with_static_dir(static_dir: impl AsRef<Path>) -> Router {
 fn build_api_router() -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/api/openapi.json", get(openapi_spec))
         .route("/api/dashboard/snapshot", get(dashboard_snapshot))
         .route("/api/dashboard/events", get(dashboard_events))
         .route("/api/replay/validate", post(validate_replay))
@@ -1445,6 +1730,51 @@ async fn health() -> Json<HealthResponse> {
         status: "ok",
         service: "regime-service",
     })
+}
+
+async fn openapi_spec() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "openapi": "3.1.0",
+        "info": {
+            "title": "Regime Sentinel Agent API",
+            "version": regime_core::VERSION
+        },
+        "paths": {
+            "/health": {
+                "get": {
+                    "operationId": "getHealth",
+                    "summary": "Read service health",
+                    "responses": {
+                        "200": {
+                            "description": "Service health"
+                        }
+                    }
+                }
+            },
+            "/api/dashboard/snapshot": {
+                "get": {
+                    "operationId": "getDashboardSnapshot",
+                    "summary": "Read current regime dashboard snapshot",
+                    "responses": {
+                        "200": {
+                            "description": "Dashboard snapshot with regime, prices, alerts, and summary"
+                        }
+                    }
+                }
+            },
+            "/api/replay/validate": {
+                "post": {
+                    "operationId": "validateReplay",
+                    "summary": "Validate replay alerts against generated shift labels",
+                    "responses": {
+                        "200": {
+                            "description": "Replay validation report"
+                        }
+                    }
+                }
+            }
+        }
+    }))
 }
 
 async fn dashboard_snapshot() -> Json<DashboardSnapshot> {

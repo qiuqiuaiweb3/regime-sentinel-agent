@@ -1,10 +1,11 @@
 use anyhow::Context;
 use mongodb::Client;
 use regime_service::{
+    gemini_summary::{GeminiSummaryConfig, run_gemini_summary_scheduler},
     live_collector::{LiveCollectorConfig, run_live_collector, run_reference_price_collector},
     mongo_store::MongoStore,
 };
-use std::{env, net::SocketAddr};
+use std::{env, net::SocketAddr, path::PathBuf};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -15,20 +16,10 @@ async fn main() -> anyhow::Result<()> {
     let port = env::var("PORT").unwrap_or_else(|_| "8080".to_string());
     let addr: SocketAddr = format!("{host}:{port}").parse()?;
     let collector_config = LiveCollectorConfig::from_env().map_err(anyhow::Error::msg)?;
+    let gemini_config = GeminiSummaryConfig::from_env().map_err(anyhow::Error::msg)?;
 
     if collector_config.enabled {
-        let collector_store = match (env::var("MONGODB_URI"), env::var("MONGODB_DB")) {
-            (Ok(uri), Ok(database_name)) => {
-                let client = Client::with_uri_str(&uri)
-                    .await
-                    .context("connect MongoDB for live collector")?;
-                Some(MongoStore::new(client.database(&database_name)))
-            }
-            _ => {
-                tracing::warn!("live collector enabled without MongoDB env; using NDJSON fallback");
-                None
-            }
-        };
+        let collector_store = mongo_store_from_env("live collector").await?;
         let market_config = collector_config.clone();
         let market_store = collector_store.clone();
         tokio::spawn(async move {
@@ -44,10 +35,39 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+    if gemini_config.throttle.enabled {
+        let gemini_store = mongo_store_from_env("Gemini summary scheduler").await?;
+        let fallback_path = PathBuf::from(
+            env::var("GEMINI_SUMMARY_NDJSON_PATH")
+                .unwrap_or_else(|_| "data/agent-summaries.ndjson".to_string()),
+        );
+        tokio::spawn(async move {
+            if let Err(error) =
+                run_gemini_summary_scheduler(gemini_config, gemini_store, fallback_path).await
+            {
+                tracing::error!(?error, "Gemini summary scheduler stopped");
+            }
+        });
+    }
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
     tracing::info!(%addr, "starting regime-service");
     axum::serve(listener, regime_service::build_router()).await?;
     Ok(())
+}
+
+async fn mongo_store_from_env(component: &str) -> anyhow::Result<Option<MongoStore>> {
+    match (env::var("MONGODB_URI"), env::var("MONGODB_DB")) {
+        (Ok(uri), Ok(database_name)) => {
+            let client = Client::with_uri_str(&uri)
+                .await
+                .with_context(|| format!("connect MongoDB for {component}"))?;
+            Ok(Some(MongoStore::new(client.database(&database_name))))
+        }
+        _ => {
+            tracing::warn!(%component, "MongoDB env missing; using NDJSON fallback");
+            Ok(None)
+        }
+    }
 }

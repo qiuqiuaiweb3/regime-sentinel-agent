@@ -245,3 +245,32 @@ async fn dashboard_events_endpoint_exposes_sse_stream() {
         Some("text/event-stream")
     );
 }
+
+#[tokio::test]
+async fn openapi_spec_exposes_agent_builder_read_tools() {
+    let response = regime_service::build_router()
+        .oneshot(
+            Request::builder()
+                .uri("/api/openapi.json")
+                .body(Body::empty())
+                .expect("openapi request"),
+        )
+        .await
+        .expect("openapi response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("openapi body");
+    let payload: Value = serde_json::from_slice(&body).expect("openapi json");
+
+    assert_eq!(payload["openapi"], "3.1.0");
+    assert_eq!(
+        payload["paths"]["/api/dashboard/snapshot"]["get"]["operationId"],
+        "getDashboardSnapshot"
+    );
+    assert_eq!(
+        payload["paths"]["/api/replay/validate"]["post"]["operationId"],
+        "validateReplay"
+    );
+}
