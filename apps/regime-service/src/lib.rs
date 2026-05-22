@@ -647,6 +647,554 @@ pub mod gemini_throttle {
     }
 }
 
+pub mod live_collector {
+    use anyhow::Context;
+    use futures_util::{SinkExt, StreamExt};
+    use regime_core::{MarketTickMeta, MarketTickRecord, RegimeStateRecord};
+    use serde::Serialize;
+    use serde_json::{Value, json};
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+    pub const DEFAULT_MARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+    pub const DEFAULT_STALE_AFTER_MS: i64 = 1_500;
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct LiveCollectorConfig {
+        pub enabled: bool,
+        pub slug: String,
+        pub series: String,
+        pub asset_ids: Vec<String>,
+        pub outcomes: Vec<String>,
+        pub market_ws_url: String,
+        pub ndjson_path: PathBuf,
+        pub stale_after_ms: i64,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct LiveMarketMeta {
+        pub slug: String,
+        pub series: String,
+        pub source: String,
+        asset_outcomes: Vec<(String, String)>,
+    }
+
+    impl LiveCollectorConfig {
+        #[allow(clippy::too_many_arguments)]
+        pub fn from_env_values(
+            enabled: Option<&str>,
+            slug: Option<&str>,
+            series: Option<&str>,
+            asset_ids: Option<&str>,
+            outcomes: Option<&str>,
+            market_ws_url: Option<&str>,
+            ndjson_path: Option<&str>,
+            stale_after_ms: Option<&str>,
+        ) -> Result<Self, String> {
+            let enabled = parse_bool(enabled.unwrap_or("false"))?;
+            let stale_after_ms = stale_after_ms
+                .unwrap_or("1500")
+                .parse::<i64>()
+                .map_err(|_| "LIVE_COLLECTOR_STALE_AFTER_MS must be an integer".to_string())?;
+            if stale_after_ms <= 0 {
+                return Err("LIVE_COLLECTOR_STALE_AFTER_MS must be greater than 0".to_string());
+            }
+            if !enabled {
+                return Ok(Self {
+                    enabled,
+                    slug: "disabled".to_string(),
+                    series: "disabled".to_string(),
+                    asset_ids: Vec::new(),
+                    outcomes: Vec::new(),
+                    market_ws_url: market_ws_url.unwrap_or(DEFAULT_MARKET_WS_URL).to_string(),
+                    ndjson_path: PathBuf::from(ndjson_path.unwrap_or("data/live-fallback.ndjson")),
+                    stale_after_ms,
+                });
+            }
+
+            let slug = required_string(slug, "LIVE_MARKET_SLUG")?;
+            let series = required_string(series, "LIVE_MARKET_SERIES")?;
+            let asset_ids = parse_csv(required_string(asset_ids, "POLYMARKET_ASSET_IDS")?);
+            if asset_ids.is_empty() {
+                return Err("POLYMARKET_ASSET_IDS must include at least one asset id".to_string());
+            }
+
+            let outcomes = outcomes.map(parse_csv).unwrap_or_else(|| {
+                (0..asset_ids.len())
+                    .map(|index| format!("OUTCOME_{index}"))
+                    .collect()
+            });
+            if outcomes.len() != asset_ids.len() {
+                return Err(
+                    "POLYMARKET_OUTCOMES must match POLYMARKET_ASSET_IDS length".to_string()
+                );
+            }
+
+            Ok(Self {
+                enabled,
+                slug: slug.to_string(),
+                series: series.to_string(),
+                asset_ids,
+                outcomes,
+                market_ws_url: market_ws_url.unwrap_or(DEFAULT_MARKET_WS_URL).to_string(),
+                ndjson_path: PathBuf::from(ndjson_path.unwrap_or("data/live-fallback.ndjson")),
+                stale_after_ms,
+            })
+        }
+
+        pub fn from_env() -> Result<Self, String> {
+            Self::from_env_values(
+                std::env::var("LIVE_COLLECTOR_ENABLED").ok().as_deref(),
+                std::env::var("LIVE_MARKET_SLUG").ok().as_deref(),
+                std::env::var("LIVE_MARKET_SERIES").ok().as_deref(),
+                std::env::var("POLYMARKET_ASSET_IDS").ok().as_deref(),
+                std::env::var("POLYMARKET_OUTCOMES").ok().as_deref(),
+                std::env::var("POLYMARKET_MARKET_WS_URL").ok().as_deref(),
+                std::env::var("LIVE_COLLECTOR_NDJSON_PATH").ok().as_deref(),
+                std::env::var("LIVE_COLLECTOR_STALE_AFTER_MS")
+                    .ok()
+                    .as_deref(),
+            )
+        }
+
+        pub fn subscription_message(&self) -> Value {
+            json!({
+                "assets_ids": self.asset_ids,
+                "type": "market",
+                "custom_feature_enabled": true
+            })
+        }
+
+        pub fn market_meta(&self) -> LiveMarketMeta {
+            LiveMarketMeta {
+                slug: self.slug.clone(),
+                series: self.series.clone(),
+                source: "clob".to_string(),
+                asset_outcomes: self
+                    .asset_ids
+                    .iter()
+                    .cloned()
+                    .zip(self.outcomes.iter().cloned())
+                    .collect(),
+            }
+        }
+    }
+
+    pub fn market_ticks_from_message(
+        payload: &str,
+        meta: &LiveMarketMeta,
+        received_at_ms: i64,
+    ) -> Result<Vec<MarketTickRecord>, String> {
+        let value: Value = serde_json::from_str(payload)
+            .map_err(|error| format!("invalid websocket JSON: {error}"))?;
+        market_ticks_from_value(&value, meta, received_at_ms)
+    }
+
+    pub fn stale_data_penalty(
+        last_event_timestamp_ms: Option<i64>,
+        now_ms: i64,
+        stale_after_ms: i64,
+    ) -> f64 {
+        match last_event_timestamp_ms {
+            Some(last_event_timestamp_ms) if now_ms - last_event_timestamp_ms <= stale_after_ms => {
+                0.0
+            }
+            _ => 1.0,
+        }
+    }
+
+    pub fn stale_regime_state(
+        config: &LiveCollectorConfig,
+        last_event_timestamp_ms: Option<i64>,
+        now_ms: i64,
+    ) -> Option<RegimeStateRecord> {
+        let stale_data_penalty =
+            stale_data_penalty(last_event_timestamp_ms, now_ms, config.stale_after_ms);
+        if stale_data_penalty == 0.0 {
+            return None;
+        }
+
+        Some(RegimeStateRecord {
+            id: config.slug.clone(),
+            regime: "STALE_DATA".to_string(),
+            confidence: 0.0,
+            updated_at_ms: now_ms,
+            previous_regime: "UNKNOWN".to_string(),
+            indicators: json!({
+                "stale_data_penalty": stale_data_penalty,
+                "last_event_timestamp_ms": last_event_timestamp_ms,
+                "stale_after_ms": config.stale_after_ms
+            }),
+            market_resolved: false,
+        })
+    }
+
+    pub async fn persist_market_tick_or_fallback(
+        store: Option<&crate::mongo_store::MongoStore>,
+        tick: &MarketTickRecord,
+        fallback_path: &Path,
+    ) -> anyhow::Result<()> {
+        let Some(store) = store else {
+            return append_ndjson_fallback(fallback_path, "market_tick", tick);
+        };
+
+        if let Err(error) = store.insert_market_tick(tick).await {
+            tracing::warn!(
+                ?error,
+                "market tick MongoDB write failed; using NDJSON fallback"
+            );
+            append_ndjson_fallback(fallback_path, "market_tick", tick)?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn persist_regime_state_or_fallback(
+        store: Option<&crate::mongo_store::MongoStore>,
+        state: &RegimeStateRecord,
+        fallback_path: &Path,
+    ) -> anyhow::Result<()> {
+        let Some(store) = store else {
+            return append_ndjson_fallback(fallback_path, "regime_state", state);
+        };
+
+        if let Err(error) = store.upsert_regime_state(state).await {
+            tracing::warn!(
+                ?error,
+                "regime state MongoDB write failed; using NDJSON fallback"
+            );
+            append_ndjson_fallback(fallback_path, "regime_state", state)?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn run_live_collector(
+        config: LiveCollectorConfig,
+        store: Option<crate::mongo_store::MongoStore>,
+    ) -> anyhow::Result<()> {
+        if !config.enabled {
+            return Ok(());
+        }
+
+        let meta = config.market_meta();
+        let mut last_event_timestamp_ms = None;
+
+        loop {
+            let ws_stream = match connect_async(&config.market_ws_url).await {
+                Ok((ws_stream, _)) => ws_stream,
+                Err(error) => {
+                    tracing::warn!(?error, "connect Polymarket market websocket failed");
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    continue;
+                }
+            };
+
+            let (mut write, mut read) = ws_stream.split();
+            write
+                .send(Message::Text(
+                    config.subscription_message().to_string().into(),
+                ))
+                .await
+                .context("send Polymarket market subscription")?;
+            let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+
+            loop {
+                tokio::select! {
+                    _ = heartbeat.tick() => {
+                        write
+                            .send(Message::Text("PING".into()))
+                            .await
+                            .context("send Polymarket market heartbeat")?;
+                        if let Some(state) = stale_regime_state(&config, last_event_timestamp_ms, unix_timestamp_ms()) {
+                            persist_regime_state_or_fallback(store.as_ref(), &state, &config.ndjson_path).await?;
+                        }
+                    }
+                    message = read.next() => {
+                        match message {
+                            Some(Ok(Message::Text(text))) => {
+                                handle_market_message(text.as_ref(), &meta, store.as_ref(), &config.ndjson_path, &mut last_event_timestamp_ms).await;
+                            }
+                            Some(Ok(Message::Binary(bytes))) => {
+                                if let Ok(text) = std::str::from_utf8(&bytes) {
+                                    handle_market_message(text, &meta, store.as_ref(), &config.ndjson_path, &mut last_event_timestamp_ms).await;
+                                }
+                            }
+                            Some(Ok(Message::Ping(payload))) => {
+                                write.send(Message::Pong(payload)).await.context("send websocket pong")?;
+                            }
+                            Some(Ok(Message::Close(close))) => {
+                                tracing::warn!(?close, "Polymarket market websocket closed");
+                                break;
+                            }
+                            Some(Ok(_)) => {}
+                            Some(Err(error)) => {
+                                tracing::warn!(?error, "Polymarket market websocket read failed");
+                                break;
+                            }
+                            None => break,
+                        }
+                    }
+                }
+            }
+
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    }
+
+    pub fn append_ndjson_fallback<T: Serialize>(
+        path: impl AsRef<Path>,
+        kind: &str,
+        record: &T,
+    ) -> anyhow::Result<()> {
+        if let Some(parent) = path.as_ref().parent() {
+            std::fs::create_dir_all(parent).context("create NDJSON fallback directory")?;
+        }
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .context("open NDJSON fallback")?;
+        serde_json::to_writer(
+            &mut file,
+            &json!({
+                "kind": kind,
+                "record": record
+            }),
+        )
+        .context("serialize NDJSON fallback")?;
+        writeln!(file).context("write NDJSON newline")?;
+        Ok(())
+    }
+
+    async fn handle_market_message(
+        payload: &str,
+        meta: &LiveMarketMeta,
+        store: Option<&crate::mongo_store::MongoStore>,
+        fallback_path: &Path,
+        last_event_timestamp_ms: &mut Option<i64>,
+    ) {
+        match market_ticks_from_message(payload, meta, unix_timestamp_ms()) {
+            Ok(ticks) => {
+                for tick in ticks {
+                    *last_event_timestamp_ms = Some(tick.timestamp_ms);
+                    if let Err(error) =
+                        persist_market_tick_or_fallback(store, &tick, fallback_path).await
+                    {
+                        tracing::warn!(?error, "persist market tick failed");
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "parse Polymarket market websocket message failed");
+            }
+        }
+    }
+
+    fn market_ticks_from_value(
+        value: &Value,
+        meta: &LiveMarketMeta,
+        received_at_ms: i64,
+    ) -> Result<Vec<MarketTickRecord>, String> {
+        if let Some(items) = value.as_array() {
+            let mut ticks = Vec::new();
+            for item in items {
+                ticks.extend(market_ticks_from_value(item, meta, received_at_ms)?);
+            }
+            return Ok(ticks);
+        }
+
+        let event_type = value
+            .get("event_type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        match event_type {
+            "price_change" => price_change_ticks(value, meta, received_at_ms),
+            "last_trade_price" => single_price_tick(value, value, meta, received_at_ms),
+            "best_bid_ask" => best_bid_ask_tick(value, meta, received_at_ms)
+                .map(|tick| tick.into_iter().collect()),
+            "book" => book_tick(value, meta, received_at_ms).map(|tick| tick.into_iter().collect()),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    fn price_change_ticks(
+        value: &Value,
+        meta: &LiveMarketMeta,
+        received_at_ms: i64,
+    ) -> Result<Vec<MarketTickRecord>, String> {
+        let changes = value
+            .get("price_changes")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "price_change missing price_changes".to_string())?;
+        let mut ticks = Vec::with_capacity(changes.len());
+        for change in changes {
+            ticks.extend(single_price_tick(change, value, meta, received_at_ms)?);
+        }
+        Ok(ticks)
+    }
+
+    fn single_price_tick(
+        item: &Value,
+        parent: &Value,
+        meta: &LiveMarketMeta,
+        received_at_ms: i64,
+    ) -> Result<Vec<MarketTickRecord>, String> {
+        let timestamp_ms = timestamp_ms(parent).unwrap_or(received_at_ms);
+        let asset_id = string_field(item, "asset_id")?;
+        Ok(vec![MarketTickRecord {
+            timestamp_ms,
+            meta: MarketTickMeta {
+                slug: meta.slug.clone(),
+                series: meta.series.clone(),
+                source: meta.source.clone(),
+            },
+            price: f64_field(item, "price")?,
+            size: f64_field(item, "size")?,
+            side: string_field(item, "side")?.to_string(),
+            outcome: meta.outcome_for_asset(asset_id),
+            receive_lag_ms: (received_at_ms - timestamp_ms).max(0),
+        }])
+    }
+
+    fn best_bid_ask_tick(
+        value: &Value,
+        meta: &LiveMarketMeta,
+        received_at_ms: i64,
+    ) -> Result<Option<MarketTickRecord>, String> {
+        let best_bid = f64_field(value, "best_bid")?;
+        let best_ask = f64_field(value, "best_ask")?;
+        let timestamp_ms = timestamp_ms(value).unwrap_or(received_at_ms);
+        let asset_id = string_field(value, "asset_id")?;
+        Ok(Some(MarketTickRecord {
+            timestamp_ms,
+            meta: MarketTickMeta {
+                slug: meta.slug.clone(),
+                series: meta.series.clone(),
+                source: meta.source.clone(),
+            },
+            price: (best_bid + best_ask) / 2.0,
+            size: 0.0,
+            side: "BBA".to_string(),
+            outcome: meta.outcome_for_asset(asset_id),
+            receive_lag_ms: (received_at_ms - timestamp_ms).max(0),
+        }))
+    }
+
+    fn book_tick(
+        value: &Value,
+        meta: &LiveMarketMeta,
+        received_at_ms: i64,
+    ) -> Result<Option<MarketTickRecord>, String> {
+        let best_bid = price_levels(value, "bids")?.into_iter().reduce(f64::max);
+        let best_ask = price_levels(value, "asks")?.into_iter().reduce(f64::min);
+        let (Some(best_bid), Some(best_ask)) = (best_bid, best_ask) else {
+            return Ok(None);
+        };
+        let timestamp_ms = timestamp_ms(value).unwrap_or(received_at_ms);
+        let asset_id = string_field(value, "asset_id")?;
+
+        Ok(Some(MarketTickRecord {
+            timestamp_ms,
+            meta: MarketTickMeta {
+                slug: meta.slug.clone(),
+                series: meta.series.clone(),
+                source: meta.source.clone(),
+            },
+            price: (best_bid + best_ask) / 2.0,
+            size: 0.0,
+            side: "BOOK".to_string(),
+            outcome: meta.outcome_for_asset(asset_id),
+            receive_lag_ms: (received_at_ms - timestamp_ms).max(0),
+        }))
+    }
+
+    fn price_levels(value: &Value, field: &str) -> Result<Vec<f64>, String> {
+        let levels = value
+            .get(field)
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("book missing {field}"))?;
+        levels
+            .iter()
+            .map(|level| f64_field(level, "price"))
+            .collect()
+    }
+
+    fn timestamp_ms(value: &Value) -> Option<i64> {
+        value
+            .get("timestamp")
+            .and_then(|timestamp| match timestamp {
+                Value::String(raw) => raw.parse::<i64>().ok(),
+                Value::Number(raw) => raw.as_i64(),
+                _ => None,
+            })
+    }
+
+    fn string_field<'a>(value: &'a Value, field: &str) -> Result<&'a str, String> {
+        value
+            .get(field)
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("missing string field {field}"))
+    }
+
+    fn f64_field(value: &Value, field: &str) -> Result<f64, String> {
+        match value.get(field) {
+            Some(Value::String(raw)) => raw
+                .parse::<f64>()
+                .map_err(|_| format!("invalid float field {field}")),
+            Some(Value::Number(raw)) => raw
+                .as_f64()
+                .ok_or_else(|| format!("invalid float field {field}")),
+            _ => Err(format!("missing float field {field}")),
+        }
+    }
+
+    fn parse_bool(value: &str) -> Result<bool, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => Err("LIVE_COLLECTOR_ENABLED must be a boolean".to_string()),
+        }
+    }
+
+    fn required_string<'a>(value: Option<&'a str>, name: &str) -> Result<&'a str, String> {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("{name} is required"))
+    }
+
+    fn parse_csv(value: &str) -> Vec<String> {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    fn unix_timestamp_ms() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64
+    }
+
+    impl LiveMarketMeta {
+        fn outcome_for_asset(&self, asset_id: &str) -> String {
+            self.asset_outcomes
+                .iter()
+                .find(|(known_asset_id, _)| known_asset_id == asset_id)
+                .map(|(_, outcome)| outcome.clone())
+                .unwrap_or_else(|| "UNKNOWN".to_string())
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     status: &'static str,
