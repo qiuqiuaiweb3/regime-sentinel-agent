@@ -20,6 +20,8 @@ infrastructure or external network access.
   stale-data downgrade, and NDJSON fallback.
 - Gemini summary request builder/parser/scheduler, disabled by default and gated by
   `GEMINI_ENABLED=true` plus `GEMINI_API_KEY`.
+- Hosted Cloud Run URL:
+  `https://regime-sentinel-agent-998092298764.asia-northeast1.run.app`
 
 ## Verification Commands
 
@@ -35,7 +37,6 @@ npm audit --omit=dev
 
 ## External Gates Not Yet Closed
 
-- Hosted Cloud Run URL reachable from the public internet.
 - Agent Builder configured in Google Cloud with `/api/openapi.json` as an OpenAPI tool.
 - Gemini summary observed in `agent_summaries` or NDJSON fallback with a real API key.
 - Live Polymarket smoke test for three real 5 minute market windows.

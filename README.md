@@ -114,6 +114,32 @@ The Cloud Build file creates an Artifact Registry Docker repository in
 pushes the image, and deploys Cloud Run with `LIVE_COLLECTOR_ENABLED=false` and
 `GEMINI_ENABLED=false`.
 
+Current hosted URL:
+
+```text
+https://regime-sentinel-agent-998092298764.asia-northeast1.run.app
+```
+
+One-time IAM grants used by the deployed service:
+
+```bash
+PROJECT_NUMBER=$(gcloud projects describe poly-market-analysis --format='value(projectNumber)')
+SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+
+gcloud secrets add-iam-policy-binding mongodb-uri \
+  --member="serviceAccount:${SA}" \
+  --role='roles/secretmanager.secretAccessor'
+
+gcloud secrets add-iam-policy-binding mongodb-db \
+  --member="serviceAccount:${SA}" \
+  --role='roles/secretmanager.secretAccessor'
+
+gcloud beta run services add-iam-policy-binding regime-sentinel-agent \
+  --region asia-northeast1 \
+  --member=allUsers \
+  --role=roles/run.invoker
+```
+
 Expected existing Secret Manager secrets:
 
 - `mongodb-uri`

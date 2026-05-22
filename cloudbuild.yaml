@@ -37,7 +37,6 @@ steps:
       - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE}:$BUILD_ID
       - --region=${_REGION}
       - --platform=managed
-      - --allow-unauthenticated
       - --set-env-vars=GOOGLE_CLOUD_PROJECT=$PROJECT_ID,GOOGLE_CLOUD_REGION=${_REGION},LIVE_COLLECTOR_ENABLED=false,GEMINI_ENABLED=false,REGIME_STATIC_DIR=/app/build
       - --set-secrets=MONGODB_URI=mongodb-uri:latest,MONGODB_DB=mongodb-db:latest
 
