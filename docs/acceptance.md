@@ -26,6 +26,8 @@ infrastructure or external network access.
   MongoDB `agent_summaries`.
 - Hosted Cloud Run URL:
   `https://regime-sentinel-agent-998092298764.asia-northeast1.run.app`
+- Public GitHub repository:
+  `https://github.com/qiuqiuaiweb3/regime-sentinel-agent`
 - Fixed replay demo artifacts:
   - `demo/replay/high-volatility-btc-window.json`
   - `demo/reports/validation-report.json`
@@ -45,6 +47,13 @@ infrastructure or external network access.
 - Cloud Run resource config is explicit in `cloudbuild.yaml`: `asia-northeast1`,
   `1` vCPU, `1Gi` memory, min `1`, max `1`, concurrency `80`, timeout `3600s`,
   service account, and Secret Manager injection.
+- GCP-network Polymarket discovery smoke was verified on 2026-05-23 JST through
+  Cloud Build:
+  - Gamma API returned live BTC 5m slugs including `btc-updown-5m-1779474300`,
+    `btc-updown-5m-1779474600`, and `btc-updown-5m-1779474900`.
+  - The corresponding event payloads included CLOB token ids for `Up` and `Down`.
+  - Direct local `curl` from this workstation still cannot connect to Polymarket
+    domains, so live tests must run from GCP or another network.
 
 ## Verification Commands
 
@@ -73,5 +82,6 @@ GEMINI_ENABLED=true GEMINI_PROVIDER=vertex GEMINI_LOCATION=global \
 - Final demo video and Devpost submission.
 
 Current local blocker: this machine cannot connect to `docs.polymarket.com`,
-`clob.polymarket.com`, or `gamma-api.polymarket.com` with `curl`, so the live
-Polymarket smoke test must be retried from Cloud Run or another network.
+`clob.polymarket.com`, or `gamma-api.polymarket.com` with `curl`; GCP network
+connectivity has been verified, but the full three-window collector smoke still
+needs to run from GCP or another network.
