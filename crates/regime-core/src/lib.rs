@@ -15,6 +15,33 @@ pub struct FeatureSnapshot {
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Serialize)]
+pub struct FeatureWindowMetrics {
+    pub window_ts_ms: i64,
+    pub window_ms: i64,
+    pub p_mid: f64,
+    pub p_fair: f64,
+    pub ofi_1s: f64,
+    pub depth_imbalance: f64,
+    pub spread: f64,
+    pub volume_acceleration: f64,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
+pub struct FeatureWindowRecord {
+    pub slug: String,
+    pub window_ts_ms: i64,
+    pub window_ms: i64,
+    pub p_mid: f64,
+    pub p_fair: f64,
+    pub fair_gap: f64,
+    pub ofi_1s: f64,
+    pub depth_imbalance: f64,
+    pub spread: f64,
+    pub volume_acceleration: f64,
+    pub feature_vector: [f64; 5],
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Serialize)]
 pub struct ScoreWeights {
     pub fair_gap_velocity: f64,
     pub depth_imbalance: f64,
@@ -196,6 +223,33 @@ pub fn score_alert(
         state,
         confidence,
         score,
+    }
+}
+
+pub fn build_feature_window(
+    slug: impl Into<String>,
+    metrics: FeatureWindowMetrics,
+) -> FeatureWindowRecord {
+    let fair_gap = metrics.p_mid - metrics.p_fair;
+
+    FeatureWindowRecord {
+        slug: slug.into(),
+        window_ts_ms: metrics.window_ts_ms,
+        window_ms: metrics.window_ms,
+        p_mid: metrics.p_mid,
+        p_fair: metrics.p_fair,
+        fair_gap,
+        ofi_1s: metrics.ofi_1s,
+        depth_imbalance: metrics.depth_imbalance,
+        spread: metrics.spread,
+        volume_acceleration: metrics.volume_acceleration,
+        feature_vector: [
+            fair_gap,
+            metrics.ofi_1s,
+            metrics.depth_imbalance,
+            metrics.spread,
+            metrics.volume_acceleration,
+        ],
     }
 }
 
