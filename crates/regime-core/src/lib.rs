@@ -315,6 +315,50 @@ pub fn build_feature_window(
     }
 }
 
+pub fn feature_snapshot_from_windows(
+    previous: &FeatureWindowRecord,
+    current: &FeatureWindowRecord,
+) -> FeatureSnapshot {
+    FeatureSnapshot {
+        fair_gap_velocity: current.fair_gap - previous.fair_gap,
+        depth_imbalance: current.depth_imbalance,
+        ofi_1s: current.ofi_1s,
+        volume_acceleration: current.volume_acceleration,
+        stale_data_penalty: 0.0,
+        p_mid_delta: current.p_mid - previous.p_mid,
+        p_fair_delta: current.p_fair - previous.p_fair,
+        liquidity_reliable: true,
+    }
+}
+
+pub fn generate_alerts_from_feature_windows(
+    windows: &[FeatureWindowRecord],
+    weights: &ScoreWeights,
+    thresholds: &ScoreThresholds,
+    horizon_ms: i64,
+) -> Vec<AlertRecord> {
+    windows
+        .windows(2)
+        .filter_map(|pair| {
+            let current = &pair[1];
+            let snapshot = feature_snapshot_from_windows(&pair[0], current);
+            let decision = score_alert(&snapshot, weights, thresholds);
+
+            if decision.state == AlertState::Equilibrium {
+                return None;
+            }
+
+            Some(AlertRecord {
+                timestamp_ms: current.window_ts_ms,
+                state: decision.state,
+                confidence: decision.confidence,
+                horizon_ms,
+                score: decision.score,
+            })
+        })
+        .collect()
+}
+
 pub fn generate_shift_labels(points: &[PricePoint], config: &ShiftLabelConfig) -> Vec<ShiftLabel> {
     let mut labels = Vec::new();
 
