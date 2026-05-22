@@ -3,7 +3,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use serde_json::{Value, json};
-use std::fs;
+use std::{fs, time::Duration};
 use tower::ServiceExt;
 
 #[tokio::test]
@@ -26,6 +26,26 @@ async fn health_endpoint_reports_service_status() {
     let payload: Value = serde_json::from_slice(&body).expect("health json");
     assert_eq!(payload["status"], "ok");
     assert_eq!(payload["service"], "regime-service");
+}
+
+#[test]
+fn agent_tool_mongodb_timeout_defaults_and_clamps() {
+    assert_eq!(
+        regime_service::agent_tool_mongodb_timeout_from_value(None),
+        Duration::from_millis(1500)
+    );
+    assert_eq!(
+        regime_service::agent_tool_mongodb_timeout_from_value(Some("100")),
+        Duration::from_millis(250)
+    );
+    assert_eq!(
+        regime_service::agent_tool_mongodb_timeout_from_value(Some("9000")),
+        Duration::from_millis(5000)
+    );
+    assert_eq!(
+        regime_service::agent_tool_mongodb_timeout_from_value(Some("not-a-number")),
+        Duration::from_millis(1500)
+    );
 }
 
 #[tokio::test]

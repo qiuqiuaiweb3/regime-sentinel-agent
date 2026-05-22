@@ -2298,6 +2298,22 @@ struct AppState {
     agent_tool_mongodb_enabled: bool,
 }
 
+const DEFAULT_AGENT_TOOL_MONGODB_TIMEOUT_MS: u64 = 1_500;
+const MIN_AGENT_TOOL_MONGODB_TIMEOUT_MS: u64 = 250;
+const MAX_AGENT_TOOL_MONGODB_TIMEOUT_MS: u64 = 5_000;
+
+pub fn agent_tool_mongodb_timeout_from_value(raw_value: Option<&str>) -> Duration {
+    let timeout_ms = raw_value
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_AGENT_TOOL_MONGODB_TIMEOUT_MS)
+        .clamp(
+            MIN_AGENT_TOOL_MONGODB_TIMEOUT_MS,
+            MAX_AGENT_TOOL_MONGODB_TIMEOUT_MS,
+        );
+
+    Duration::from_millis(timeout_ms)
+}
+
 #[derive(Debug, Serialize)]
 pub struct DashboardSnapshot {
     mode: String,
@@ -3296,7 +3312,20 @@ async fn agent_tool_mongo_store(state: &AppState) -> Option<mongo_store::MongoSt
         return None;
     };
 
-    match mongodb::Client::with_uri_str(&uri).await {
+    let mut options = match mongodb::options::ClientOptions::parse(&uri).await {
+        Ok(options) => options,
+        Err(error) => {
+            tracing::warn!(?error, "parse MongoDB URI for Agent tool failed");
+            return None;
+        }
+    };
+    options.server_selection_timeout = Some(agent_tool_mongodb_timeout_from_value(
+        std::env::var("AGENT_TOOL_MONGODB_TIMEOUT_MS")
+            .ok()
+            .as_deref(),
+    ));
+
+    match mongodb::Client::with_options(options) {
         Ok(client) => Some(mongo_store::MongoStore::new(
             client.database(&database_name),
         )),
