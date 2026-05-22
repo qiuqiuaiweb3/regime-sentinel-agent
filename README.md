@@ -287,11 +287,11 @@ artifacts to `gs://poly-market-analysis_cloudbuild/live-smoke/$BUILD_ID/`.
 
 Latest passing run:
 
-- build id: `e5936042-2ad1-4afc-8a19-4fcbcf445cb4`
+- build id: `631222a7-e26a-4971-8376-6198059b5c44`
 - artifact prefix:
-  `gs://poly-market-analysis_cloudbuild/live-smoke/e5936042-2ad1-4afc-8a19-4fcbcf445cb4/`
-- windows: `btc-updown-5m-1779477300`, `btc-updown-5m-1779477600`,
-  `btc-updown-5m-1779477900`
+  `gs://poly-market-analysis_cloudbuild/live-smoke/631222a7-e26a-4971-8376-6198059b5c44/`
+- windows: `btc-updown-5m-1779483000`, `btc-updown-5m-1779483300`,
+  `btc-updown-5m-1779483600`
 - result: `summary.json` had `passed: true`
 
 ## Validation Gates

@@ -71,15 +71,24 @@ hosted Google Cloud infrastructure.
   `regime_states`, `alerts`, `agent_summaries`, and `backtest_runs`.
 - Cloud Run resource config is explicit in `cloudbuild.yaml`: `asia-northeast1`,
   `1` vCPU, `1Gi` memory, min `1`, max `1`, concurrency `80`, timeout `3600s`,
-  service account, and Secret Manager injection.
+  service account, Secret Manager injection, and
+  `AGENT_TOOL_MONGODB_TIMEOUT_MS=1500`.
 - Cloud Run deployment was verified on 2026-05-23 JST:
-  - build id: `0c039eb6-22dd-4dd5-9d3b-ab8a0b4121c3`
-  - revision: `regime-sentinel-agent-00006-kcs`
+  - build id: `43e9b928-8195-41c6-a438-2adb4ad67014`
+  - revision: `regime-sentinel-agent-00008-vxp`
   - image:
-    `asia-northeast1-docker.pkg.dev/poly-market-analysis/regime-sentinel/regime-service:0c039eb6-22dd-4dd5-9d3b-ab8a0b4121c3`
+    `asia-northeast1-docker.pkg.dev/poly-market-analysis/regime-sentinel/regime-service:43e9b928-8195-41c6-a438-2adb4ad67014`
   - `/health` returned `{"status":"ok","service":"regime-service"}`.
   - `/api/openapi.json` returned OpenAPI `3.0.3`, the hosted Cloud Run server URL,
-    and a JSON request schema for `POST /api/replay/validate`.
+    a JSON request schema for `POST /api/replay/validate`, and Agent Builder
+    operations including `getCurrentRegime` and `findSimilarWindows`.
+  - Hosted Agent tool endpoints returned HTTP `200` with sample fallback when
+    MongoDB was unavailable from Cloud Run:
+    - `GET /api/agent/current-regime`
+    - `GET /api/agent/recent-alerts`
+    - `GET /api/agent/backtest-metrics`
+    - `GET /api/agent/market-summary`
+    - `POST /api/agent/similar-windows`
 - Agent Builder / Conversational Agents was configured on 2026-05-23 JST:
   - Dialogflow API: enabled for `poly-market-analysis`.
   - agent:
@@ -90,6 +99,9 @@ hosted Google Cloud infrastructure.
     `projects/poly-market-analysis/locations/asia-northeast1/agents/3e5926c5-ed12-40de-a944-b66fae7fe1e0/playbooks/c186ebd4-adcb-4ea6-b400-893768e30ff4`
   - The playbook references the Regime Sentinel Dashboard API tool and instructs
     it to call `getDashboardSnapshot` before summarizing current regime state.
+  - The OpenAPI tool was refreshed from the hosted `/api/openapi.json` on
+    2026-05-23 JST and verified to include `/api/agent/current-regime`,
+    `/api/agent/market-summary`, and `/api/agent/similar-windows`.
 - GCP-network Polymarket discovery smoke was verified on 2026-05-23 JST through
   Cloud Build:
   - Gamma API returned live BTC 5m slugs including `btc-updown-5m-1779474300`,
@@ -99,16 +111,19 @@ hosted Google Cloud infrastructure.
     domains, so live tests must run from GCP or another network.
 - Three-window live Polymarket smoke was verified on 2026-05-23 JST through
   Cloud Build:
-  - build id: `e5936042-2ad1-4afc-8a19-4fcbcf445cb4`
+  - build id: `631222a7-e26a-4971-8376-6198059b5c44`
   - artifact prefix:
-    `gs://poly-market-analysis_cloudbuild/live-smoke/e5936042-2ad1-4afc-8a19-4fcbcf445cb4/`
+    `gs://poly-market-analysis_cloudbuild/live-smoke/631222a7-e26a-4971-8376-6198059b5c44/`
   - `summary.json` had `passed: true`.
   - Windows:
-    - `btc-updown-5m-1779477300`: `market_ticks=48`, `reference_ticks=168`.
-    - `btc-updown-5m-1779477600`: `market_ticks=39937`, `reference_ticks=205`.
-    - `btc-updown-5m-1779477900`: `market_ticks=190`, `reference_ticks=149`.
+    - `btc-updown-5m-1779483000`: `market_ticks=34276`, `reference_ticks=101`.
+    - `btc-updown-5m-1779483300`: `market_ticks=362`, `reference_ticks=145`.
+    - `btc-updown-5m-1779483600`: `market_ticks=6`, `reference_ticks=189`.
   - Each smoke ran for `30` seconds and observed `BTC-USD`, `UP`, and `DOWN`
     outcomes.
+  - The live-smoke Cloud Build compiles `live_smoke` before market discovery and
+    skips the current window when it is within the last 90 seconds, so discovered
+    slugs do not expire during Rust compilation.
 
 ## Verification Commands
 

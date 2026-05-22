@@ -10,12 +10,19 @@ steps:
         apt-get install -y --no-install-recommends ca-certificates cmake curl jq pkg-config
         rm -rf /var/lib/apt/lists/*
 
+        /usr/local/cargo/bin/cargo build -q -p regime-service --bin live_smoke
+
         mkdir -p /workspace/live-smoke
         now_s=$$(date +%s)
         floor_s=$$(( now_s - now_s % 300 ))
+        elapsed_s=$$(( now_s - floor_s ))
+        start_offset=0
+        if [ "$${elapsed_s}" -gt 210 ]; then
+          start_offset=300
+        fi
         : > /workspace/live-smoke/markets.tmp
 
-        for offset in 0 300 600; do
+        for offset in "$${start_offset}" "$$(( start_offset + 300 ))" "$$(( start_offset + 600 ))"; do
           slug="btc-updown-5m-$$(( floor_s + offset ))"
           curl -fsS "https://gamma-api.polymarket.com/events/slug/$${slug}" \
             | jq --arg slug "$${slug}" '
@@ -59,7 +66,7 @@ steps:
           POLYMARKET_OUTCOMES="$${outcomes}" \
           LIVE_COLLECTOR_NDJSON_PATH="/workspace/live-smoke/$${slug}.ndjson" \
           LIVE_SMOKE_DURATION_SECONDS="${_LIVE_SMOKE_DURATION_SECONDS}" \
-            /usr/local/cargo/bin/cargo run -q -p regime-service --bin live_smoke \
+            /workspace/target/debug/live_smoke \
             | tee "/workspace/live-smoke/$${slug}.json"
         done
 
