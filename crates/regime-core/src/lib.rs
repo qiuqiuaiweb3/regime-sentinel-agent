@@ -49,6 +49,34 @@ pub struct AlertDecision {
     pub score: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PricePoint {
+    pub timestamp_ms: i64,
+    pub p_mid: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShiftLabelConfig {
+    pub horizons_ms: Vec<i64>,
+    pub min_move: f64,
+    pub persist_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ShiftDirection {
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShiftLabel {
+    pub baseline_time_ms: i64,
+    pub onset_time_ms: i64,
+    pub horizon_ms: i64,
+    pub direction: ShiftDirection,
+    pub magnitude: f64,
+}
+
 pub fn score_alert(
     features: &FeatureSnapshot,
     weights: &ScoreWeights,
@@ -84,4 +112,61 @@ pub fn score_alert(
         confidence,
         score,
     }
+}
+
+pub fn generate_shift_labels(points: &[PricePoint], config: &ShiftLabelConfig) -> Vec<ShiftLabel> {
+    let mut labels = Vec::new();
+
+    for baseline in points {
+        for horizon_ms in &config.horizons_ms {
+            let Some(onset) = first_point_at_or_after(points, baseline.timestamp_ms + horizon_ms)
+            else {
+                continue;
+            };
+
+            let magnitude = onset.p_mid - baseline.p_mid;
+            if magnitude.abs() < config.min_move {
+                continue;
+            }
+
+            let Some(persisted) =
+                first_point_at_or_after(points, onset.timestamp_ms + config.persist_ms)
+            else {
+                continue;
+            };
+
+            let persisted_magnitude = persisted.p_mid - baseline.p_mid;
+            if !same_persistent_direction(magnitude, persisted_magnitude, config.min_move) {
+                continue;
+            }
+
+            labels.push(ShiftLabel {
+                baseline_time_ms: baseline.timestamp_ms,
+                onset_time_ms: onset.timestamp_ms,
+                horizon_ms: *horizon_ms,
+                direction: if magnitude.is_sign_positive() {
+                    ShiftDirection::Up
+                } else {
+                    ShiftDirection::Down
+                },
+                magnitude: magnitude.abs(),
+            });
+        }
+    }
+
+    labels
+}
+
+pub fn compute_lead_time_ms(alert_time_ms: i64, shift_onset_time_ms: i64) -> i64 {
+    shift_onset_time_ms - alert_time_ms
+}
+
+fn first_point_at_or_after(points: &[PricePoint], timestamp_ms: i64) -> Option<&PricePoint> {
+    points
+        .iter()
+        .find(|point| point.timestamp_ms >= timestamp_ms)
+}
+
+fn same_persistent_direction(initial: f64, persisted: f64, min_move: f64) -> bool {
+    initial.signum() == persisted.signum() && persisted.abs() >= min_move
 }
