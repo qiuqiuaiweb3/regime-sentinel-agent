@@ -9,6 +9,8 @@ use regime_core::{
     generate_shift_labels, validate_alerts,
 };
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use tower_http::services::{ServeDir, ServeFile};
 
 pub mod mongo_indexes {
     use std::time::Duration;
@@ -669,6 +671,25 @@ pub struct ReplayValidationResponse {
 }
 
 pub fn build_router() -> Router {
+    let static_dir =
+        PathBuf::from(std::env::var("REGIME_STATIC_DIR").unwrap_or_else(|_| "build".to_string()));
+
+    if static_dir.join("index.html").exists() {
+        return build_router_with_static_dir(static_dir);
+    }
+
+    build_api_router()
+}
+
+pub fn build_router_with_static_dir(static_dir: impl AsRef<Path>) -> Router {
+    let static_dir = static_dir.as_ref().to_path_buf();
+    let index_file = static_dir.join("index.html");
+
+    build_api_router()
+        .fallback_service(ServeDir::new(static_dir).fallback(ServeFile::new(index_file)))
+}
+
+fn build_api_router() -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/api/replay/validate", post(validate_replay))

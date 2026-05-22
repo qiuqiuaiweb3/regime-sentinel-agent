@@ -3,6 +3,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use serde_json::{Value, json};
+use std::fs;
 use tower::ServiceExt;
 
 #[tokio::test]
@@ -155,4 +156,45 @@ async fn replay_validation_endpoint_generates_alerts_from_feature_windows() {
     assert_eq!(payload["alerts"][0]["timestamp_ms"], 750);
     assert_eq!(payload["report"]["summary"]["early"], 1);
     assert_eq!(payload["report"]["results"][0]["lead_time_ms"], 250);
+}
+
+#[tokio::test]
+async fn static_frontend_routes_fallback_to_index_without_hiding_api_routes() {
+    let temp_dir = tempfile::tempdir().expect("static temp dir");
+    fs::write(
+        temp_dir.path().join("index.html"),
+        "<!doctype html><title>Regime Sentinel Agent</title>",
+    )
+    .expect("write index");
+
+    let app = regime_service::build_router_with_static_dir(temp_dir.path());
+
+    let frontend_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/replay/btc-updown-5m")
+                .body(Body::empty())
+                .expect("frontend request"),
+        )
+        .await
+        .expect("frontend response");
+
+    assert_eq!(frontend_response.status(), StatusCode::OK);
+    let frontend_body = to_bytes(frontend_response.into_body(), usize::MAX)
+        .await
+        .expect("frontend body");
+    assert!(String::from_utf8_lossy(&frontend_body).contains("Regime Sentinel Agent"));
+
+    let health_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .expect("health request"),
+        )
+        .await
+        .expect("health response");
+
+    assert_eq!(health_response.status(), StatusCode::OK);
 }
