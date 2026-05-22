@@ -139,6 +139,15 @@ pub struct MongoIndexSpec {
     pub ttl_seconds: Option<i64>,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+pub struct VectorSearchSpec {
+    pub collection: CollectionKind,
+    pub name: &'static str,
+    pub path: &'static str,
+    pub dimensions: u32,
+    pub similarity: &'static str,
+}
+
 pub fn score_alert(
     features: &FeatureSnapshot,
     weights: &ScoreWeights,
@@ -285,7 +294,7 @@ pub fn mongo_collection_names() -> [&'static str; 6] {
     ]
 }
 
-pub fn mongo_index_specs() -> [MongoIndexSpec; 7] {
+pub fn mongo_index_specs() -> [MongoIndexSpec; 6] {
     [
         MongoIndexSpec {
             collection: CollectionKind::MarketTicks,
@@ -299,13 +308,6 @@ pub fn mongo_index_specs() -> [MongoIndexSpec; 7] {
             name: "feature_windows_slug_window_ts",
             fields: &["slug", "window_ts"],
             unique: true,
-            ttl_seconds: None,
-        },
-        MongoIndexSpec {
-            collection: CollectionKind::FeatureWindows,
-            name: "feature_windows_feature_vector",
-            fields: &["feature_vector"],
-            unique: false,
             ttl_seconds: None,
         },
         MongoIndexSpec {
@@ -337,6 +339,16 @@ pub fn mongo_index_specs() -> [MongoIndexSpec; 7] {
             ttl_seconds: None,
         },
     ]
+}
+
+pub fn vector_search_specs() -> [VectorSearchSpec; 1] {
+    [VectorSearchSpec {
+        collection: CollectionKind::FeatureWindows,
+        name: "feature_windows_vector_search",
+        path: "feature_vector",
+        dimensions: 5,
+        similarity: "cosine",
+    }]
 }
 
 fn first_point_at_or_after(points: &[PricePoint], timestamp_ms: i64) -> Option<&PricePoint> {

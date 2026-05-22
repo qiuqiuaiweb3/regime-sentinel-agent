@@ -1,4 +1,7 @@
-use regime_core::{CollectionKind, mongo_collection_names, mongo_index_specs};
+use regime_core::{
+    CollectionKind, VectorSearchSpec, mongo_collection_names, mongo_index_specs,
+    vector_search_specs,
+};
 
 #[test]
 fn mongo_collection_names_match_plan() {
@@ -41,4 +44,24 @@ fn mongo_index_specs_cover_hot_path_and_validation_collections() {
             && spec.name == "backtest_runs_created_at"
             && spec.fields == ["created_at"]
     }));
+}
+
+#[test]
+fn vector_search_specs_are_kept_separate_from_regular_indexes() {
+    assert!(
+        !mongo_index_specs()
+            .iter()
+            .any(|spec| spec.name == "feature_windows_feature_vector")
+    );
+
+    assert_eq!(
+        vector_search_specs(),
+        [VectorSearchSpec {
+            collection: CollectionKind::FeatureWindows,
+            name: "feature_windows_vector_search",
+            path: "feature_vector",
+            dimensions: 5,
+            similarity: "cosine"
+        }]
+    );
 }
