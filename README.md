@@ -11,12 +11,16 @@ This repository is the independent hackathon implementation. It is not a copy of
 `poly-market-analysis` or `poly-tx`; prior work is used only as interface and design
 experience.
 
-Phase 0 scaffold is in progress:
+Current implementation status:
 
 - Rust workspace with `regime-core`, `regime-service`, and `regime-replay`.
 - Google Cloud defaults target `asia-northeast1`.
 - MongoDB and Gemini configuration are provided through environment variables.
-- Gemini calls are cost-limited by default.
+- Replay validation can consume prebuilt alerts or generate alerts from feature windows.
+- MongoDB collection/index bootstrap is available through an explicit CLI.
+- MongoDB document writers exist for market ticks, feature windows, regime states, alerts,
+  agent summaries, and backtest runs.
+- Gemini calls are disabled by default and cost-limited when enabled.
 
 ## Architecture
 
