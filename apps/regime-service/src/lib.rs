@@ -12,11 +12,13 @@ pub mod mongo_indexes {
     use std::time::Duration;
 
     use mongodb::{
-        IndexModel,
-        bson::Document,
+        IndexModel, SearchIndexModel, SearchIndexType,
+        bson::{Document, doc},
         options::{CreateCollectionOptions, IndexOptions, TimeseriesOptions},
     };
-    use regime_core::{CollectionKind, mongo_collection_specs, mongo_index_specs};
+    use regime_core::{
+        CollectionKind, mongo_collection_specs, mongo_index_specs, vector_search_specs,
+    };
 
     #[derive(Debug, Clone)]
     pub struct CollectionCreateModel {
@@ -28,6 +30,12 @@ pub mod mongo_indexes {
     pub struct CollectionIndexModel {
         pub collection_name: &'static str,
         pub index: IndexModel,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct CollectionSearchIndexModel {
+        pub collection_name: &'static str,
+        pub index: SearchIndexModel,
     }
 
     pub fn collection_create_models() -> Vec<CollectionCreateModel> {
@@ -75,6 +83,27 @@ pub mod mongo_indexes {
                     collection_name: collection_name(spec.collection),
                     index: IndexModel::builder().keys(keys).options(options).build(),
                 }
+            })
+            .collect()
+    }
+
+    pub fn vector_search_index_models() -> Vec<CollectionSearchIndexModel> {
+        vector_search_specs()
+            .into_iter()
+            .map(|spec| CollectionSearchIndexModel {
+                collection_name: collection_name(spec.collection),
+                index: SearchIndexModel::builder()
+                    .definition(doc! {
+                        "fields": [{
+                            "type": "vector",
+                            "path": spec.path,
+                            "numDimensions": spec.dimensions as i32,
+                            "similarity": spec.similarity,
+                        }]
+                    })
+                    .name(spec.name.to_string())
+                    .index_type(SearchIndexType::VectorSearch)
+                    .build(),
             })
             .collect()
     }

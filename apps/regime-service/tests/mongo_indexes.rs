@@ -1,3 +1,4 @@
+use mongodb::SearchIndexType;
 use mongodb::bson::Bson;
 use std::time::Duration;
 
@@ -73,4 +74,33 @@ fn regular_index_models_do_not_include_vector_search_index() {
             .and_then(|options| options.name.as_deref())
             == Some("feature_windows_vector_search")
     }));
+}
+
+#[test]
+fn vector_search_index_models_use_atlas_search_model_shape() {
+    let models = regime_service::mongo_indexes::vector_search_index_models();
+    let model = models
+        .iter()
+        .find(|model| model.collection_name == "feature_windows")
+        .expect("feature_windows vector search index");
+
+    assert_eq!(
+        model.index.name.as_deref(),
+        Some("feature_windows_vector_search")
+    );
+    assert!(matches!(
+        model.index.index_type,
+        Some(SearchIndexType::VectorSearch)
+    ));
+
+    let fields = model
+        .index
+        .definition
+        .get_array("fields")
+        .expect("vector fields");
+    let field = fields[0].as_document().expect("vector field document");
+    assert_eq!(field.get_str("type"), Ok("vector"));
+    assert_eq!(field.get_str("path"), Ok("feature_vector"));
+    assert_eq!(field.get_i32("numDimensions"), Ok(5));
+    assert_eq!(field.get_str("similarity"), Ok("cosine"));
 }
