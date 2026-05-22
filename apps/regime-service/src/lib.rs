@@ -11,13 +11,48 @@ use serde::{Deserialize, Serialize};
 pub mod mongo_indexes {
     use std::time::Duration;
 
-    use mongodb::{IndexModel, bson::Document, options::IndexOptions};
-    use regime_core::{CollectionKind, mongo_index_specs};
+    use mongodb::{
+        IndexModel,
+        bson::Document,
+        options::{CreateCollectionOptions, IndexOptions, TimeseriesOptions},
+    };
+    use regime_core::{CollectionKind, mongo_collection_specs, mongo_index_specs};
+
+    #[derive(Debug, Clone)]
+    pub struct CollectionCreateModel {
+        pub collection_name: &'static str,
+        pub options: Option<CreateCollectionOptions>,
+    }
 
     #[derive(Debug, Clone)]
     pub struct CollectionIndexModel {
         pub collection_name: &'static str,
         pub index: IndexModel,
+    }
+
+    pub fn collection_create_models() -> Vec<CollectionCreateModel> {
+        mongo_collection_specs()
+            .into_iter()
+            .map(|spec| {
+                let options = spec.time_series.map(|time_series| {
+                    let mut options = CreateCollectionOptions::default();
+                    options.timeseries = Some(
+                        TimeseriesOptions::builder()
+                            .time_field(time_series.time_field.to_string())
+                            .meta_field(time_series.meta_field.to_string())
+                            .build(),
+                    );
+                    options.expire_after_seconds =
+                        Some(Duration::from_secs(time_series.expire_after_seconds as u64));
+                    options
+                });
+
+                CollectionCreateModel {
+                    collection_name: spec.name,
+                    options,
+                }
+            })
+            .collect()
     }
 
     pub fn regular_index_models() -> Vec<CollectionIndexModel> {

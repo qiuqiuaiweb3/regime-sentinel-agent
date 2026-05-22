@@ -1,4 +1,29 @@
 use mongodb::bson::Bson;
+use std::time::Duration;
+
+#[test]
+fn collection_create_models_include_time_series_ttl_for_market_ticks() {
+    let models = regime_service::mongo_indexes::collection_create_models();
+    let market_ticks = models
+        .iter()
+        .find(|model| model.collection_name == "market_ticks")
+        .expect("market_ticks collection");
+
+    let options = market_ticks.options.as_ref().expect("market_ticks options");
+    let timeseries = options.timeseries.as_ref().expect("timeseries options");
+    assert_eq!(timeseries.time_field, "timestamp");
+    assert_eq!(timeseries.meta_field.as_deref(), Some("meta"));
+    assert_eq!(
+        options.expire_after_seconds,
+        Some(Duration::from_secs(604_800))
+    );
+
+    let alerts = models
+        .iter()
+        .find(|model| model.collection_name == "alerts")
+        .expect("alerts collection");
+    assert!(alerts.options.is_none());
+}
 
 #[test]
 fn regular_index_models_include_keys_options_and_collection_names() {
