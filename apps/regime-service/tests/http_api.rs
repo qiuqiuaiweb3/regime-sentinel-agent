@@ -248,6 +248,54 @@ async fn dashboard_events_endpoint_exposes_sse_stream() {
 }
 
 #[tokio::test]
+async fn agent_tool_endpoints_return_demo_safe_payloads_without_mongodb() {
+    let app = regime_service::build_router_with_agent_tool_mongodb(false);
+
+    let current_regime = get_json(
+        app.clone(),
+        "/api/agent/current-regime?slug=btc-updown-5m-1769000000",
+    )
+    .await;
+    assert_eq!(current_regime["source"], "sample");
+    assert_eq!(current_regime["regime"]["regime"], "EARLY_RISK");
+
+    let recent_alerts = get_json(
+        app.clone(),
+        "/api/agent/recent-alerts?slug=btc-updown-5m-1769000000&limit=3",
+    )
+    .await;
+    assert_eq!(recent_alerts["source"], "sample");
+    assert_eq!(recent_alerts["alerts"][0]["state"], "EARLY_RISK");
+
+    let backtest_metrics = get_json(app.clone(), "/api/agent/backtest-metrics?limit=1").await;
+    assert_eq!(backtest_metrics["source"], "sample");
+    assert_eq!(
+        backtest_metrics["runs"][0]["metrics"]["median_lead_time_ms"],
+        250
+    );
+
+    let market_summary = get_json(
+        app.clone(),
+        "/api/agent/market-summary?slug=btc-updown-5m-1769000000",
+    )
+    .await;
+    assert_eq!(market_summary["source"], "sample");
+    assert_eq!(market_summary["summary"]["model"], "gemini-disabled-demo");
+
+    let similar_windows_body = json!({
+        "slug": "btc-updown-5m-1769000000",
+        "query_vector": [0.05, 0.42, 0.31, 0.03, 2.1],
+        "limit": 3
+    });
+    let similar_windows = post_json(app, "/api/agent/similar-windows", similar_windows_body).await;
+    assert_eq!(similar_windows["source"], "sample");
+    assert_eq!(
+        similar_windows["windows"][0]["slug"],
+        "btc-updown-5m-1769000000"
+    );
+}
+
+#[tokio::test]
 async fn openapi_spec_exposes_agent_builder_read_tools() {
     let response = regime_service::build_router()
         .oneshot(
@@ -279,12 +327,75 @@ async fn openapi_spec_exposes_agent_builder_read_tools() {
         "validateReplay"
     );
     assert_eq!(
+        payload["paths"]["/api/agent/current-regime"]["get"]["operationId"],
+        "getCurrentRegime"
+    );
+    assert_eq!(
+        payload["paths"]["/api/agent/recent-alerts"]["get"]["operationId"],
+        "queryRecentAlerts"
+    );
+    assert_eq!(
+        payload["paths"]["/api/agent/similar-windows"]["post"]["operationId"],
+        "findSimilarWindows"
+    );
+    assert_eq!(
+        payload["paths"]["/api/agent/backtest-metrics"]["get"]["operationId"],
+        "getBacktestMetrics"
+    );
+    assert_eq!(
+        payload["paths"]["/api/agent/market-summary"]["get"]["operationId"],
+        "generateMarketSummary"
+    );
+    assert_eq!(
         payload["paths"]["/api/replay/validate"]["post"]["requestBody"]["content"]["application/json"]
             ["schema"]["$ref"],
         "#/components/schemas/ReplayValidationRequest"
     );
     assert_eq!(
+        payload["paths"]["/api/agent/similar-windows"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/FindSimilarWindowsRequest"
+    );
+    assert_eq!(
         payload["components"]["schemas"]["ReplayValidationRequest"]["required"][0],
         "price_points"
     );
+}
+
+async fn get_json(app: axum::Router, uri: &str) -> Value {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .body(Body::empty())
+                .expect("get request"),
+        )
+        .await
+        .expect("get response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("get body");
+    serde_json::from_slice(&body).expect("get json")
+}
+
+async fn post_json(app: axum::Router, uri: &str, body: Value) -> Value {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("post request"),
+        )
+        .await
+        .expect("post response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("post body");
+    serde_json::from_slice(&body).expect("post json")
 }

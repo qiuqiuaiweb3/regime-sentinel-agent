@@ -1,5 +1,7 @@
 use axum::{
     Json, Router,
+    extract::Query,
+    extract::State,
     http::StatusCode,
     response::sse::{Event, KeepAlive, Sse},
     routing::{get, post},
@@ -451,7 +453,10 @@ pub mod mongo_documents {
 }
 
 pub mod mongo_store {
-    use mongodb::{Database, bson::Document};
+    use mongodb::{
+        Database,
+        bson::{Document, doc},
+    };
     use regime_core::{
         AgentSummaryRecord, AlertEventRecord, BacktestRunRecord, FeatureWindowRecord,
         MarketTickRecord, RegimeStateRecord,
@@ -547,6 +552,68 @@ pub mod mongo_store {
                 .await?;
 
             Ok(())
+        }
+
+        pub async fn latest_regime_state(
+            &self,
+            slug: Option<&str>,
+        ) -> mongodb::error::Result<Option<Document>> {
+            let filter = slug.map(|slug| doc! { "_id": slug }).unwrap_or_default();
+            self.db
+                .collection::<Document>("regime_states")
+                .find_one(filter)
+                .sort(doc! { "updated_at": -1 })
+                .await
+        }
+
+        pub async fn recent_alerts(
+            &self,
+            slug: Option<&str>,
+            limit: i64,
+        ) -> mongodb::error::Result<Vec<Document>> {
+            let filter = slug.map(|slug| doc! { "slug": slug }).unwrap_or_default();
+            let mut cursor = self
+                .db
+                .collection::<Document>("alerts")
+                .find(filter)
+                .sort(doc! { "created_at": -1 })
+                .limit(limit)
+                .await?;
+            let mut documents = Vec::new();
+
+            while cursor.advance().await? {
+                documents.push(cursor.deserialize_current()?);
+            }
+
+            Ok(documents)
+        }
+
+        pub async fn recent_backtest_runs(
+            &self,
+            limit: i64,
+        ) -> mongodb::error::Result<Vec<Document>> {
+            let mut cursor = self
+                .db
+                .collection::<Document>("backtest_runs")
+                .find(doc! {})
+                .sort(doc! { "created_at": -1 })
+                .limit(limit)
+                .await?;
+            let mut documents = Vec::new();
+
+            while cursor.advance().await? {
+                documents.push(cursor.deserialize_current()?);
+            }
+
+            Ok(documents)
+        }
+
+        pub async fn latest_agent_summary(&self) -> mongodb::error::Result<Option<Document>> {
+            self.db
+                .collection::<Document>("agent_summaries")
+                .find_one(doc! {})
+                .sort(doc! { "bucket_start": -1 })
+                .await
         }
 
         pub async fn find_similar_windows(
@@ -2208,6 +2275,24 @@ pub struct ReplayValidationResponse {
     ablation: Vec<AblationMetric>,
 }
 
+#[derive(Debug, Deserialize)]
+struct AgentToolQuery {
+    slug: Option<String>,
+    limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FindSimilarWindowsRequest {
+    slug: String,
+    query_vector: Vec<f64>,
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct AppState {
+    agent_tool_mongodb_enabled: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct DashboardSnapshot {
     regime: DashboardRegime,
@@ -2256,6 +2341,12 @@ pub fn build_router() -> Router {
     build_api_router()
 }
 
+pub fn build_router_with_agent_tool_mongodb(enabled: bool) -> Router {
+    build_api_router_with_state(AppState {
+        agent_tool_mongodb_enabled: enabled,
+    })
+}
+
 pub fn build_router_with_static_dir(static_dir: impl AsRef<Path>) -> Router {
     let static_dir = static_dir.as_ref().to_path_buf();
     let index_file = static_dir.join("index.html");
@@ -2265,12 +2356,24 @@ pub fn build_router_with_static_dir(static_dir: impl AsRef<Path>) -> Router {
 }
 
 fn build_api_router() -> Router {
+    build_api_router_with_state(AppState {
+        agent_tool_mongodb_enabled: true,
+    })
+}
+
+fn build_api_router_with_state(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/api/openapi.json", get(openapi_spec))
         .route("/api/dashboard/snapshot", get(dashboard_snapshot))
         .route("/api/dashboard/events", get(dashboard_events))
+        .route("/api/agent/current-regime", get(get_current_regime))
+        .route("/api/agent/recent-alerts", get(query_recent_alerts))
+        .route("/api/agent/similar-windows", post(find_similar_windows))
+        .route("/api/agent/backtest-metrics", get(get_backtest_metrics))
+        .route("/api/agent/market-summary", get(generate_market_summary))
         .route("/api/replay/validate", post(validate_replay))
+        .with_state(state)
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -2311,6 +2414,119 @@ async fn openapi_spec() -> Json<serde_json::Value> {
                     "responses": {
                         "200": {
                             "description": "Dashboard snapshot with regime, prices, alerts, and summary"
+                        }
+                    }
+                }
+            },
+            "/api/agent/current-regime": {
+                "get": {
+                    "operationId": "getCurrentRegime",
+                    "summary": "Read the latest regime state from MongoDB memory or demo fallback",
+                    "parameters": [{
+                        "name": "slug",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "type": "string"
+                        }
+                    }],
+                    "responses": {
+                        "200": {
+                            "description": "Latest regime state"
+                        }
+                    }
+                }
+            },
+            "/api/agent/recent-alerts": {
+                "get": {
+                    "operationId": "queryRecentAlerts",
+                    "summary": "Read recent regime alerts from MongoDB memory or demo fallback",
+                    "parameters": [
+                        {
+                            "name": "slug",
+                            "in": "query",
+                            "required": false,
+                            "schema": {
+                                "type": "string"
+                            }
+                        },
+                        {
+                            "name": "limit",
+                            "in": "query",
+                            "required": false,
+                            "schema": {
+                                "type": "integer",
+                                "format": "int64",
+                                "minimum": 1,
+                                "maximum": 50
+                            }
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Recent alert list"
+                        }
+                    }
+                }
+            },
+            "/api/agent/similar-windows": {
+                "post": {
+                    "operationId": "findSimilarWindows",
+                    "summary": "Find historical windows with MongoDB Vector Search",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/FindSimilarWindowsRequest"
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Similar historical windows"
+                        }
+                    }
+                }
+            },
+            "/api/agent/backtest-metrics": {
+                "get": {
+                    "operationId": "getBacktestMetrics",
+                    "summary": "Read latest backtest metrics from MongoDB memory or demo fallback",
+                    "parameters": [{
+                        "name": "limit",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "type": "integer",
+                            "format": "int64",
+                            "minimum": 1,
+                            "maximum": 10
+                        }
+                    }],
+                    "responses": {
+                        "200": {
+                            "description": "Backtest metrics"
+                        }
+                    }
+                }
+            },
+            "/api/agent/market-summary": {
+                "get": {
+                    "operationId": "generateMarketSummary",
+                    "summary": "Read cached Gemini market summary without forcing a new model call",
+                    "parameters": [{
+                        "name": "slug",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "type": "string"
+                        }
+                    }],
+                    "responses": {
+                        "200": {
+                            "description": "Cached market summary"
                         }
                     }
                 }
@@ -2379,6 +2595,30 @@ async fn openapi_spec() -> Json<serde_json::Value> {
                         "synchronous_tolerance_ms": {
                             "type": "integer",
                             "format": "int64"
+                        }
+                    }
+                },
+                "FindSimilarWindowsRequest": {
+                    "type": "object",
+                    "required": ["slug", "query_vector"],
+                    "properties": {
+                        "slug": {
+                            "type": "string"
+                        },
+                        "query_vector": {
+                            "type": "array",
+                            "items": {
+                                "type": "number",
+                                "format": "double"
+                            },
+                            "minItems": 5,
+                            "maxItems": 5
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "format": "int32",
+                            "minimum": 1,
+                            "maximum": 25
                         }
                     }
                 },
@@ -2618,6 +2858,260 @@ fn sample_dashboard_snapshot() -> DashboardSnapshot {
             summary: "Gemini summaries are disabled by default.",
         },
     }
+}
+
+async fn get_current_regime(
+    State(state): State<AppState>,
+    Query(query): Query<AgentToolQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if let Some(store) = agent_tool_mongo_store(&state).await {
+        match store.latest_regime_state(query.slug.as_deref()).await {
+            Ok(Some(regime)) => {
+                return Ok(Json(serde_json::json!({
+                    "source": "mongodb",
+                    "regime": regime,
+                })));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(?error, "read current regime from MongoDB failed");
+            }
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "source": "sample",
+        "regime": sample_agent_regime(query.slug.as_deref()),
+    })))
+}
+
+async fn query_recent_alerts(
+    State(state): State<AppState>,
+    Query(query): Query<AgentToolQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let limit = bounded_limit(query.limit, 10, 50);
+    if let Some(store) = agent_tool_mongo_store(&state).await {
+        match store.recent_alerts(query.slug.as_deref(), limit).await {
+            Ok(alerts) if !alerts.is_empty() => {
+                return Ok(Json(serde_json::json!({
+                    "source": "mongodb",
+                    "alerts": alerts,
+                })));
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(?error, "read recent alerts from MongoDB failed");
+            }
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "source": "sample",
+        "alerts": sample_agent_alerts(query.slug.as_deref()),
+    })))
+}
+
+async fn find_similar_windows(
+    State(state): State<AppState>,
+    Json(request): Json<FindSimilarWindowsRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if request.query_vector.len() != 5 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "query_vector must contain exactly 5 values".to_string(),
+        ));
+    }
+
+    let limit = request.limit.unwrap_or(5).clamp(1, 25);
+    if let Some(store) = agent_tool_mongo_store(&state).await {
+        match store
+            .find_similar_windows(&request.slug, &request.query_vector, limit)
+            .await
+        {
+            Ok(windows) if !windows.is_empty() => {
+                return Ok(Json(serde_json::json!({
+                    "source": "mongodb",
+                    "windows": windows,
+                })));
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(?error, "read similar windows from MongoDB failed");
+            }
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "source": "sample",
+        "windows": sample_similar_windows(&request.slug),
+    })))
+}
+
+async fn get_backtest_metrics(
+    State(state): State<AppState>,
+    Query(query): Query<AgentToolQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let limit = bounded_limit(query.limit, 1, 10);
+    if let Some(store) = agent_tool_mongo_store(&state).await {
+        match store.recent_backtest_runs(limit).await {
+            Ok(runs) if !runs.is_empty() => {
+                return Ok(Json(serde_json::json!({
+                    "source": "mongodb",
+                    "runs": runs,
+                })));
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(?error, "read backtest runs from MongoDB failed");
+            }
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "source": "sample",
+        "runs": sample_backtest_runs(),
+    })))
+}
+
+async fn generate_market_summary(
+    State(state): State<AppState>,
+    Query(_query): Query<AgentToolQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if let Some(store) = agent_tool_mongo_store(&state).await {
+        match store.latest_agent_summary().await {
+            Ok(Some(summary)) => {
+                return Ok(Json(serde_json::json!({
+                    "source": "mongodb",
+                    "summary": summary,
+                    "generated_now": false,
+                })));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(?error, "read agent summary from MongoDB failed");
+            }
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "source": "sample",
+        "summary": sample_agent_summary(),
+        "generated_now": false,
+    })))
+}
+
+async fn agent_tool_mongo_store(state: &AppState) -> Option<mongo_store::MongoStore> {
+    if !state.agent_tool_mongodb_enabled {
+        return None;
+    }
+
+    let (Ok(uri), Ok(database_name)) = (std::env::var("MONGODB_URI"), std::env::var("MONGODB_DB"))
+    else {
+        return None;
+    };
+
+    match mongodb::Client::with_uri_str(&uri).await {
+        Ok(client) => Some(mongo_store::MongoStore::new(
+            client.database(&database_name),
+        )),
+        Err(error) => {
+            tracing::warn!(?error, "connect MongoDB for Agent tool failed");
+            None
+        }
+    }
+}
+
+fn bounded_limit(limit: Option<i64>, default: i64, max: i64) -> i64 {
+    limit.unwrap_or(default).clamp(1, max)
+}
+
+fn sample_agent_regime(slug: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "id": slug.unwrap_or("btc-updown-5m-1769000000"),
+        "regime": "EARLY_RISK",
+        "confidence": 0.82,
+        "updated_at_ms": 1_769_000_000_750_i64,
+        "previous_regime": "EQUILIBRIUM",
+        "indicators": {
+            "fair_gap": 0.05,
+            "ofi_1s": 0.42,
+            "depth_imbalance": 0.31,
+            "stale_data_penalty": 0.0
+        },
+        "market_resolved": false
+    })
+}
+
+fn sample_agent_alerts(slug: Option<&str>) -> Vec<serde_json::Value> {
+    vec![serde_json::json!({
+        "slug": slug.unwrap_or("btc-updown-5m-1769000000"),
+        "created_at_ms": 1_769_000_000_750_i64,
+        "severity": "warning",
+        "state": "EARLY_RISK",
+        "direction": "UP",
+        "trigger": "fair_gap_velocity+order_flow",
+        "message": "Fair probability gap and order-flow imbalance moved together.",
+        "gemini_explained": false
+    })]
+}
+
+fn sample_similar_windows(slug: &str) -> Vec<serde_json::Value> {
+    vec![serde_json::json!({
+        "slug": slug,
+        "window_ts_ms": 1_769_000_000_750_i64,
+        "window_ms": 1_000,
+        "p_mid": 0.54,
+        "p_fair": 0.49,
+        "fair_gap": 0.05,
+        "ofi_1s": 0.42,
+        "depth_imbalance": 0.31,
+        "spread": 0.03,
+        "volume_acceleration": 2.1,
+        "score": 0.98
+    })]
+}
+
+fn sample_backtest_runs() -> Vec<serde_json::Value> {
+    vec![serde_json::json!({
+        "created_at_ms": 1_769_000_010_000_i64,
+        "parameters": {
+            "horizons_ms": [1000, 5000, 30000],
+            "synchronous_tolerance_ms": 100
+        },
+        "data_range": {
+            "markets": ["btc-updown-5m-1769000000"],
+            "start_ms": 1_769_000_000_000_i64,
+            "end_ms": 1_769_000_004_000_i64
+        },
+        "metrics": {
+            "median_lead_time_ms": 250,
+            "p75_lead_time_ms": 250,
+            "precision": 1.0,
+            "recall": 0.333,
+            "horizon_pr_auc": [
+                {"horizon_ms": 1000, "pr_auc": 1.0},
+                {"horizon_ms": 5000, "pr_auc": 0.0},
+                {"horizon_ms": 30000, "pr_auc": 0.0}
+            ]
+        },
+        "ablation": []
+    })]
+}
+
+fn sample_agent_summary() -> serde_json::Value {
+    serde_json::json!({
+        "bucket_start_ms": 1_769_000_000_000_i64,
+        "bucket_seconds": 1_800,
+        "model": "gemini-disabled-demo",
+        "thinking_level": "LOW",
+        "summary": "Cached demo summary: early risk increased because fair-gap velocity, order flow, and depth imbalance moved in the same direction.",
+        "alert_ids": ["btc-updown-5m-1769000000:1769000000750"],
+        "similar_window_ids": ["btc-updown-5m-1769000000:1769000000750"],
+        "token_usage": {
+            "input_tokens": 0,
+            "output_tokens": 0
+        }
+    })
 }
 
 async fn validate_replay(
