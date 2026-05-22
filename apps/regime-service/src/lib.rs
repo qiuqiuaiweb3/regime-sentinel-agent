@@ -571,6 +571,308 @@ pub mod mongo_store {
     }
 }
 
+pub mod demo_seed {
+    use crate::mongo_documents::{
+        agent_summary_document, alert_document, backtest_run_document, feature_window_document,
+        market_tick_document, regime_state_document,
+    };
+    use mongodb::Database;
+    use mongodb::bson::{Document, doc};
+    use regime_core::{
+        AgentSummaryRecord, AlertEventRecord, BacktestRunRecord, FeatureWindowMetrics,
+        FeatureWindowRecord, MarketTickMeta, MarketTickRecord, RegimeStateRecord,
+        build_feature_window,
+    };
+    use serde::Serialize;
+    use serde_json::json;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[derive(Debug, Clone)]
+    pub struct DemoSeedRecords {
+        pub market_tick: MarketTickRecord,
+        pub feature_window: FeatureWindowRecord,
+        pub regime_state: RegimeStateRecord,
+        pub alert: AlertEventRecord,
+        pub agent_summary: AgentSummaryRecord,
+        pub backtest_run: BacktestRunRecord,
+    }
+
+    impl DemoSeedRecords {
+        pub fn collection_names(&self) -> [&'static str; 6] {
+            [
+                "market_ticks",
+                "feature_windows",
+                "regime_states",
+                "alerts",
+                "agent_summaries",
+                "backtest_runs",
+            ]
+        }
+    }
+
+    #[derive(Debug, Serialize)]
+    pub struct DemoSeedSummary {
+        pub run_id: String,
+        pub slug: String,
+        pub written_collections: [&'static str; 6],
+        pub early_alert_lead_time_ms: i64,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct DemoSeedCountQuery {
+        pub collection_name: &'static str,
+        pub filter: Document,
+    }
+
+    #[derive(Debug, Serialize)]
+    pub struct DemoSeedCount {
+        pub collection_name: &'static str,
+        pub count: u64,
+    }
+
+    pub fn demo_seed_records() -> DemoSeedRecords {
+        let run_id = generate_demo_seed_run_id();
+        demo_seed_records_at(unix_timestamp_ms(), &run_id)
+    }
+
+    pub fn generate_demo_seed_run_id() -> String {
+        format!("demo-{}", unix_timestamp_ms())
+    }
+
+    pub fn demo_seed_records_at(base_ms: i64, run_id: &str) -> DemoSeedRecords {
+        let slug = "btc-updown-5m-demo";
+        let market_tick = MarketTickRecord {
+            timestamp_ms: base_ms,
+            meta: MarketTickMeta {
+                slug: slug.to_string(),
+                series: "btc-updown-5m".to_string(),
+                source: "demo-replay".to_string(),
+            },
+            price: 0.54,
+            size: 100.0,
+            side: "BUY".to_string(),
+            outcome: "UP".to_string(),
+            receive_lag_ms: 42,
+        };
+        let feature_window = build_feature_window(
+            slug,
+            FeatureWindowMetrics {
+                window_ts_ms: base_ms,
+                window_ms: 1_000,
+                p_mid: 0.54,
+                p_fair: 0.49,
+                ofi_1s: 0.42,
+                depth_imbalance: 0.31,
+                spread: 0.03,
+                volume_acceleration: 2.1,
+            },
+        );
+        let regime_state = RegimeStateRecord {
+            id: slug.to_string(),
+            regime: "EARLY_RISK".to_string(),
+            confidence: 0.71,
+            updated_at_ms: base_ms,
+            previous_regime: "EQUILIBRIUM".to_string(),
+            indicators: json!({
+                "fair_gap": 0.05,
+                "ofi_1s": 0.42,
+                "depth_imbalance": 0.31,
+                "volume_acceleration": 2.1,
+                "lead_time_ms": 250,
+                "demo_run_id": run_id
+            }),
+            market_resolved: false,
+        };
+        let alert = AlertEventRecord {
+            slug: slug.to_string(),
+            created_at_ms: base_ms,
+            severity: "HIGH".to_string(),
+            state: "EARLY_RISK".to_string(),
+            direction: "UP".to_string(),
+            trigger: "fair_gap_velocity+ofi_1s+volume_acceleration".to_string(),
+            message: "Demo early-risk alert fired 250ms before the labeled shift.".to_string(),
+            gemini_explained: false,
+        };
+        let agent_summary = AgentSummaryRecord {
+            bucket_start_ms: base_ms,
+            bucket_seconds: 1_800,
+            model: "gemini-3-flash-preview".to_string(),
+            thinking_level: "LOW".to_string(),
+            summary:
+                "Demo summary: order flow, fair-gap movement, and volume acceleration raised early regime-shift risk."
+                    .to_string(),
+            alert_ids: vec!["demo-alert-early-risk".to_string()],
+            similar_window_ids: vec!["demo-window-high-volatility".to_string()],
+            token_usage: json!({ "estimated": true, "demo_run_id": run_id }),
+        };
+        let backtest_run = BacktestRunRecord {
+            created_at_ms: base_ms,
+            parameters: json!({
+                "input": "demo/replay/high-volatility-btc-window.json",
+                "alert_horizon_ms": 1000,
+                "synchronous_tolerance_ms": 100,
+                "demo_run_id": run_id
+            }),
+            data_range: json!({
+                "window_id": "high-volatility-btc-window",
+                "labels_generated": 3
+            }),
+            metrics: json!({
+                "median_lead_time_ms": 250.0,
+                "p75_lead_time_ms": 250.0,
+                "precision": 1.0,
+                "recall": 0.3333333333333333
+            }),
+            ablation: json!([
+                { "variant": "baseline", "early": 1, "false_alerts": 0 },
+                { "variant": "without_volume_acceleration", "early": 0, "false_alerts": 0 }
+            ]),
+        };
+
+        DemoSeedRecords {
+            market_tick,
+            feature_window,
+            regime_state,
+            alert,
+            agent_summary,
+            backtest_run,
+        }
+    }
+
+    fn unix_timestamp_ms() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time is after Unix epoch")
+            .as_millis() as i64
+    }
+
+    pub fn demo_seed_count_queries(run_id: &str) -> [DemoSeedCountQuery; 6] {
+        let slug = "btc-updown-5m-demo";
+        [
+            DemoSeedCountQuery {
+                collection_name: "market_ticks",
+                filter: doc! { "meta.slug": slug, "demo_run_id": run_id },
+            },
+            DemoSeedCountQuery {
+                collection_name: "feature_windows",
+                filter: doc! { "slug": slug, "demo_run_id": run_id },
+            },
+            DemoSeedCountQuery {
+                collection_name: "regime_states",
+                filter: doc! {
+                    "_id": slug,
+                    "demo_run_id": run_id,
+                    "indicators.demo_run_id": run_id,
+                },
+            },
+            DemoSeedCountQuery {
+                collection_name: "alerts",
+                filter: doc! { "slug": slug, "demo_run_id": run_id },
+            },
+            DemoSeedCountQuery {
+                collection_name: "agent_summaries",
+                filter: doc! { "alert_ids": "demo-alert-early-risk", "demo_run_id": run_id },
+            },
+            DemoSeedCountQuery {
+                collection_name: "backtest_runs",
+                filter: doc! {
+                    "data_range.window_id": "high-volatility-btc-window",
+                    "demo_run_id": run_id,
+                },
+            },
+        ]
+    }
+
+    pub async fn write_demo_seed(
+        db: &Database,
+        run_id: &str,
+    ) -> mongodb::error::Result<DemoSeedSummary> {
+        let records = demo_seed_records_at(unix_timestamp_ms(), run_id);
+        db.collection::<Document>("market_ticks")
+            .insert_one(with_demo_run_id(
+                market_tick_document(&records.market_tick),
+                run_id,
+            ))
+            .await?;
+        db.collection::<Document>("feature_windows")
+            .insert_one(with_demo_run_id(
+                feature_window_document(&records.feature_window),
+                run_id,
+            ))
+            .await?;
+
+        let mut regime_document =
+            with_demo_run_id(regime_state_document(&records.regime_state), run_id);
+        regime_document.insert("_id", records.regime_state.id.clone());
+        db.collection::<Document>("regime_states")
+            .replace_one(doc! { "_id": &records.regime_state.id }, regime_document)
+            .upsert(true)
+            .await?;
+
+        db.collection::<Document>("alerts")
+            .insert_one(with_demo_run_id(alert_document(&records.alert), run_id))
+            .await?;
+        db.collection::<Document>("agent_summaries")
+            .insert_one(with_demo_run_id(
+                agent_summary_document(&records.agent_summary),
+                run_id,
+            ))
+            .await?;
+        db.collection::<Document>("backtest_runs")
+            .insert_one(with_demo_run_id(
+                backtest_run_document(&records.backtest_run),
+                run_id,
+            ))
+            .await?;
+
+        Ok(DemoSeedSummary {
+            run_id: run_id.to_string(),
+            slug: records.regime_state.id.clone(),
+            written_collections: records.collection_names(),
+            early_alert_lead_time_ms: 250,
+        })
+    }
+
+    pub async fn count_demo_seed(
+        db: &mongodb::Database,
+        run_id: &str,
+    ) -> mongodb::error::Result<Vec<DemoSeedCount>> {
+        let mut counts = Vec::new();
+        for query in demo_seed_count_queries(run_id) {
+            let count = db
+                .collection::<Document>(query.collection_name)
+                .count_documents(query.filter)
+                .await?;
+            counts.push(DemoSeedCount {
+                collection_name: query.collection_name,
+                count,
+            });
+        }
+        Ok(counts)
+    }
+
+    pub fn validate_demo_seed_counts(counts: &[DemoSeedCount]) -> Result<(), String> {
+        let missing = counts
+            .iter()
+            .filter(|count| count.count == 0)
+            .map(|count| count.collection_name)
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        Err(format!(
+            "missing demo seed documents in collections: {}",
+            missing.join(", ")
+        ))
+    }
+
+    fn with_demo_run_id(mut document: Document, run_id: &str) -> Document {
+        document.insert("demo_run_id", run_id);
+        document
+    }
+}
+
 pub mod gemini_throttle {
     #[derive(Debug, Clone, Copy, Eq, PartialEq)]
     pub struct GeminiThrottleConfig {

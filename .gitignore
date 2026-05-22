@@ -8,6 +8,7 @@ build/
 .env.*
 !.env.example
 LOCAL_ENVIRONMENT.md
+.regime-demo-seed.json
 
 *.log
 *.tmp

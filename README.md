@@ -51,6 +51,17 @@ Initialize MongoDB collections and indexes explicitly after `.env` is configured
 cargo run -p regime-service --bin init_mongodb
 ```
 
+Seed and verify demo documents in the six acceptance collections:
+
+```bash
+cargo run -p regime-service --bin seed_demo_mongodb
+cargo run -p regime-service --bin verify_demo_mongodb
+```
+
+The seed command writes an ignored `.regime-demo-seed.json` file with the latest
+`demo_run_id`; the verify command uses that id and exits nonzero if any collection
+has no matching document.
+
 ## Environment
 
 Required later for live/cloud runs:
