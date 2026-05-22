@@ -198,3 +198,50 @@ async fn static_frontend_routes_fallback_to_index_without_hiding_api_routes() {
 
     assert_eq!(health_response.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn dashboard_snapshot_endpoint_returns_replay_ready_payload() {
+    let response = regime_service::build_router()
+        .oneshot(
+            Request::builder()
+                .uri("/api/dashboard/snapshot")
+                .body(Body::empty())
+                .expect("snapshot request"),
+        )
+        .await
+        .expect("snapshot response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("snapshot body");
+    let payload: Value = serde_json::from_slice(&body).expect("snapshot json");
+
+    assert_eq!(payload["regime"]["state"], "EARLY_RISK");
+    assert_eq!(payload["regime"]["confidence"], "Normal");
+    assert_eq!(payload["price_points"][0]["p_mid"], 0.50);
+    assert_eq!(payload["alerts"][0]["lead_time_ms"], 250);
+    assert_eq!(payload["gemini_summary"]["enabled"], false);
+}
+
+#[tokio::test]
+async fn dashboard_events_endpoint_exposes_sse_stream() {
+    let response = regime_service::build_router()
+        .oneshot(
+            Request::builder()
+                .uri("/api/dashboard/events")
+                .body(Body::empty())
+                .expect("events request"),
+        )
+        .await
+        .expect("events response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+}

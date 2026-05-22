@@ -1777,6 +1777,7 @@ dependencies = [
  "anyhow",
  "axum",
  "dotenvy",
+ "futures-util",
  "mongodb",
  "regime-core",
  "serde",

@@ -9,6 +9,7 @@ repository.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 dotenvy.workspace = true
+futures-util.workspace = true
 mongodb.workspace = true
 regime-core = { path = "../../crates/regime-core" }
 serde.workspace = true

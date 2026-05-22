@@ -1,15 +1,19 @@
 use axum::{
     Json, Router,
     http::StatusCode,
+    response::sse::{Event, KeepAlive, Sse},
     routing::{get, post},
 };
+use futures_util::stream;
 use regime_core::{
     AlertRecord, FeatureWindowRecord, PricePoint, ScoreThresholds, ScoreWeights, ShiftLabel,
     ShiftLabelConfig, ValidationReport, generate_alerts_from_feature_windows,
     generate_shift_labels, validate_alerts,
 };
 use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tower_http::services::{ServeDir, ServeFile};
 
 pub mod mongo_indexes {
@@ -670,6 +674,43 @@ pub struct ReplayValidationResponse {
     report: ValidationReport,
 }
 
+#[derive(Debug, Serialize)]
+pub struct DashboardSnapshot {
+    regime: DashboardRegime,
+    price_points: Vec<DashboardPricePoint>,
+    alerts: Vec<DashboardAlert>,
+    gemini_summary: DashboardGeminiSummary,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DashboardRegime {
+    state: &'static str,
+    confidence: &'static str,
+    updated_at_ms: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DashboardPricePoint {
+    timestamp_ms: i64,
+    p_mid: f64,
+    p_fair: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DashboardAlert {
+    timestamp_ms: i64,
+    state: &'static str,
+    lead_time_ms: i64,
+    score: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DashboardGeminiSummary {
+    enabled: bool,
+    generated_at_ms: Option<i64>,
+    summary: &'static str,
+}
+
 pub fn build_router() -> Router {
     let static_dir =
         PathBuf::from(std::env::var("REGIME_STATIC_DIR").unwrap_or_else(|_| "build".to_string()));
@@ -692,6 +733,8 @@ pub fn build_router_with_static_dir(static_dir: impl AsRef<Path>) -> Router {
 fn build_api_router() -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/api/dashboard/snapshot", get(dashboard_snapshot))
+        .route("/api/dashboard/events", get(dashboard_events))
         .route("/api/replay/validate", post(validate_replay))
 }
 
@@ -700,6 +743,62 @@ async fn health() -> Json<HealthResponse> {
         status: "ok",
         service: "regime-service",
     })
+}
+
+async fn dashboard_snapshot() -> Json<DashboardSnapshot> {
+    Json(sample_dashboard_snapshot())
+}
+
+async fn dashboard_events() -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+    let stream = stream::unfold(
+        tokio::time::interval(Duration::from_secs(1)),
+        |mut interval| async {
+            interval.tick().await;
+            let data = serde_json::to_string(&sample_dashboard_snapshot())
+                .expect("dashboard snapshot serializes");
+            Some((Ok(Event::default().event("snapshot").data(data)), interval))
+        },
+    );
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+fn sample_dashboard_snapshot() -> DashboardSnapshot {
+    DashboardSnapshot {
+        regime: DashboardRegime {
+            state: "EARLY_RISK",
+            confidence: "Normal",
+            updated_at_ms: 1_769_000_000_750,
+        },
+        price_points: vec![
+            DashboardPricePoint {
+                timestamp_ms: 1_769_000_000_000,
+                p_mid: 0.50,
+                p_fair: 0.49,
+            },
+            DashboardPricePoint {
+                timestamp_ms: 1_769_000_000_750,
+                p_mid: 0.54,
+                p_fair: 0.49,
+            },
+            DashboardPricePoint {
+                timestamp_ms: 1_769_000_001_000,
+                p_mid: 0.62,
+                p_fair: 0.51,
+            },
+        ],
+        alerts: vec![DashboardAlert {
+            timestamp_ms: 1_769_000_000_750,
+            state: "EARLY_RISK",
+            lead_time_ms: 250,
+            score: 1.94,
+        }],
+        gemini_summary: DashboardGeminiSummary {
+            enabled: false,
+            generated_at_ms: None,
+            summary: "Gemini summaries are disabled by default.",
+        },
+    }
 }
 
 async fn validate_replay(
