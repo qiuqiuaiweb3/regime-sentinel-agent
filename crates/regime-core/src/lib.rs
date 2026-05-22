@@ -77,6 +77,47 @@ pub struct ShiftLabel {
     pub magnitude: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AlertRecord {
+    pub timestamp_ms: i64,
+    pub state: AlertState,
+    pub confidence: AlertConfidence,
+    pub horizon_ms: i64,
+    pub score: f64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum DetectionTiming {
+    Early,
+    Synchronous,
+    Late,
+    FalseAlert,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AlertValidationResult {
+    pub alert_time_ms: i64,
+    pub shift_onset_time_ms: Option<i64>,
+    pub lead_time_ms: Option<i64>,
+    pub horizon_ms: i64,
+    pub timing: DetectionTiming,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ValidationSummary {
+    pub total_alerts: usize,
+    pub early: usize,
+    pub synchronous: usize,
+    pub late: usize,
+    pub false_alerts: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidationReport {
+    pub results: Vec<AlertValidationResult>,
+    pub summary: ValidationSummary,
+}
+
 pub fn score_alert(
     features: &FeatureSnapshot,
     weights: &ScoreWeights,
@@ -161,6 +202,57 @@ pub fn compute_lead_time_ms(alert_time_ms: i64, shift_onset_time_ms: i64) -> i64
     shift_onset_time_ms - alert_time_ms
 }
 
+pub fn validate_alerts(
+    alerts: &[AlertRecord],
+    labels: &[ShiftLabel],
+    synchronous_tolerance_ms: i64,
+) -> ValidationReport {
+    let mut results = Vec::with_capacity(alerts.len());
+    let mut summary = ValidationSummary {
+        total_alerts: alerts.len(),
+        early: 0,
+        synchronous: 0,
+        late: 0,
+        false_alerts: 0,
+    };
+
+    for alert in alerts {
+        let Some(label) = nearest_label_for_horizon(alert, labels) else {
+            summary.false_alerts += 1;
+            results.push(AlertValidationResult {
+                alert_time_ms: alert.timestamp_ms,
+                shift_onset_time_ms: None,
+                lead_time_ms: None,
+                horizon_ms: alert.horizon_ms,
+                timing: DetectionTiming::FalseAlert,
+            });
+            continue;
+        };
+
+        let lead_time_ms = compute_lead_time_ms(alert.timestamp_ms, label.onset_time_ms);
+        let timing = if lead_time_ms.abs() <= synchronous_tolerance_ms {
+            summary.synchronous += 1;
+            DetectionTiming::Synchronous
+        } else if lead_time_ms > 0 {
+            summary.early += 1;
+            DetectionTiming::Early
+        } else {
+            summary.late += 1;
+            DetectionTiming::Late
+        };
+
+        results.push(AlertValidationResult {
+            alert_time_ms: alert.timestamp_ms,
+            shift_onset_time_ms: Some(label.onset_time_ms),
+            lead_time_ms: Some(lead_time_ms),
+            horizon_ms: alert.horizon_ms,
+            timing,
+        });
+    }
+
+    ValidationReport { results, summary }
+}
+
 fn first_point_at_or_after(points: &[PricePoint], timestamp_ms: i64) -> Option<&PricePoint> {
     points
         .iter()
@@ -169,4 +261,14 @@ fn first_point_at_or_after(points: &[PricePoint], timestamp_ms: i64) -> Option<&
 
 fn same_persistent_direction(initial: f64, persisted: f64, min_move: f64) -> bool {
     initial.signum() == persisted.signum() && persisted.abs() >= min_move
+}
+
+fn nearest_label_for_horizon<'a>(
+    alert: &AlertRecord,
+    labels: &'a [ShiftLabel],
+) -> Option<&'a ShiftLabel> {
+    labels
+        .iter()
+        .filter(|label| label.horizon_ms == alert.horizon_ms)
+        .min_by_key(|label| (label.onset_time_ms - alert.timestamp_ms).abs())
 }
