@@ -1530,6 +1530,21 @@ pub mod live_collector {
                 "channels": ["ticker", "heartbeat"]
             })
         }
+
+        pub fn ndjson_path_for_role(&self, role: &str) -> PathBuf {
+            let extension = self
+                .ndjson_path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("ndjson");
+            self.ndjson_path
+                .with_extension(format!("{role}.{extension}"))
+        }
+
+        pub fn with_ndjson_path(mut self, ndjson_path: PathBuf) -> Self {
+            self.ndjson_path = ndjson_path;
+            self
+        }
     }
 
     pub fn market_ticks_from_message(
@@ -1884,6 +1899,9 @@ pub mod live_collector {
             }
         }
 
+        let outcomes: Vec<String> = outcomes.into_iter().collect();
+        let passed = live_smoke_passed(market_ticks, reference_ticks, &outcomes, &[]);
+
         Ok(LiveSmokeReport {
             slug: slug.to_string(),
             duration_seconds,
@@ -1891,11 +1909,24 @@ pub mod live_collector {
             market_ticks,
             reference_ticks,
             stale_states,
-            outcomes: outcomes.into_iter().collect(),
+            outcomes,
             first_tick_timestamp_ms,
             last_tick_timestamp_ms,
-            passed: market_ticks > 0 && reference_ticks > 0,
+            passed,
         })
+    }
+
+    pub fn live_smoke_passed(
+        market_ticks: usize,
+        reference_ticks: usize,
+        outcomes: &[String],
+        required_outcomes: &[&str],
+    ) -> bool {
+        market_ticks > 0
+            && reference_ticks > 0
+            && required_outcomes
+                .iter()
+                .all(|required| outcomes.iter().any(|outcome| outcome == required))
     }
 
     async fn handle_market_message(

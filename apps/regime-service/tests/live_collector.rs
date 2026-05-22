@@ -1,5 +1,5 @@
 use regime_service::live_collector::{
-    LiveCollectorConfig, append_ndjson_fallback, market_ticks_from_message,
+    LiveCollectorConfig, append_ndjson_fallback, live_smoke_passed, market_ticks_from_message,
     persist_market_tick_or_fallback, reference_tick_from_coinbase_message, stale_data_penalty,
     stale_regime_state, summarize_live_smoke_ndjson,
 };
@@ -70,6 +70,37 @@ fn live_collector_config_builds_coinbase_reference_subscription() {
             "product_ids": ["BTC-USD"],
             "channels": ["ticker", "heartbeat"]
         })
+    );
+}
+
+#[test]
+fn live_collector_config_derives_role_specific_fallback_paths() {
+    let config = LiveCollectorConfig::from_env_values(
+        Some("true"),
+        Some("btc-updown-5m-1769000000"),
+        Some("btc-updown-5m"),
+        Some("yes-token,no-token"),
+        Some("UP,DOWN"),
+        None,
+        Some("/tmp/regime-fallback.ndjson"),
+        Some("1500"),
+    )
+    .expect("collector config");
+
+    assert_eq!(
+        config.ndjson_path_for_role("market"),
+        std::path::PathBuf::from("/tmp/regime-fallback.market.ndjson")
+    );
+    assert_eq!(
+        config.ndjson_path_for_role("reference"),
+        std::path::PathBuf::from("/tmp/regime-fallback.reference.ndjson")
+    );
+    assert_eq!(
+        config
+            .clone()
+            .with_ndjson_path(config.ndjson_path_for_role("market"))
+            .ndjson_path,
+        std::path::PathBuf::from("/tmp/regime-fallback.market.ndjson")
     );
 }
 
@@ -282,4 +313,34 @@ fn live_smoke_summary_counts_market_and_reference_ticks() {
     assert_eq!(report.first_tick_timestamp_ms, Some(1_769_000_000_100));
     assert_eq!(report.last_tick_timestamp_ms, Some(1_769_000_000_200));
     assert_eq!(report.outcomes, vec!["BTC-USD", "UP"]);
+}
+
+#[test]
+fn live_smoke_gate_requires_market_reference_and_required_outcomes() {
+    let outcomes = vec!["UP".to_string(), "DOWN".to_string(), "BTC-USD".to_string()];
+
+    assert!(live_smoke_passed(
+        1,
+        1,
+        &outcomes,
+        &["UP", "DOWN", "BTC-USD"]
+    ));
+    assert!(!live_smoke_passed(
+        0,
+        1,
+        &outcomes,
+        &["UP", "DOWN", "BTC-USD"]
+    ));
+    assert!(!live_smoke_passed(
+        1,
+        0,
+        &outcomes,
+        &["UP", "DOWN", "BTC-USD"]
+    ));
+    assert!(!live_smoke_passed(
+        1,
+        1,
+        &["UP".to_string(), "BTC-USD".to_string()],
+        &["UP", "DOWN", "BTC-USD"]
+    ));
 }

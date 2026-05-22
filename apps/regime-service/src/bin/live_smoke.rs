@@ -1,10 +1,10 @@
 use anyhow::{Context, bail};
 use regime_service::live_collector::{
-    LiveCollectorConfig, LiveSmokeReport, run_live_collector, run_reference_price_collector,
-    summarize_live_smoke_ndjson,
+    LiveCollectorConfig, LiveSmokeReport, live_smoke_passed, run_live_collector,
+    run_reference_price_collector, summarize_live_smoke_ndjson,
 };
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 #[tokio::main]
@@ -28,15 +28,13 @@ async fn main() -> anyhow::Result<()> {
         bail!("LIVE_SMOKE_DURATION_SECONDS must be greater than 0");
     }
 
-    let market_path = path_with_extension_suffix(&config.ndjson_path, "market");
-    let reference_path = path_with_extension_suffix(&config.ndjson_path, "reference");
+    let market_path = config.ndjson_path_for_role("market");
+    let reference_path = config.ndjson_path_for_role("reference");
     remove_if_exists(&market_path).context("clear previous market live smoke NDJSON")?;
     remove_if_exists(&reference_path).context("clear previous reference live smoke NDJSON")?;
 
-    let mut market_config = config.clone();
-    market_config.ndjson_path = market_path.clone();
-    let mut reference_config = config.clone();
-    reference_config.ndjson_path = reference_path.clone();
+    let market_config = config.clone().with_ndjson_path(market_path.clone());
+    let reference_config = config.clone().with_ndjson_path(reference_path.clone());
     let market_task = tokio::spawn(async move { run_live_collector(market_config, None).await });
     let reference_task =
         tokio::spawn(async move { run_reference_price_collector(reference_config, None).await });
@@ -50,6 +48,8 @@ async fn main() -> anyhow::Result<()> {
     let market_report = summarize_live_smoke_ndjson(&config.slug, duration_seconds, &market_path)?;
     let reference_report =
         summarize_live_smoke_ndjson(&config.slug, duration_seconds, &reference_path)?;
+    let mut required_outcomes: Vec<&str> = config.outcomes.iter().map(String::as_str).collect();
+    required_outcomes.push(config.reference_product_id.as_str());
     let report = combine_reports(
         &config.slug,
         duration_seconds,
@@ -57,22 +57,15 @@ async fn main() -> anyhow::Result<()> {
         &reference_path,
         &market_report,
         &reference_report,
+        &required_outcomes,
     );
     println!("{}", serde_json::to_string_pretty(&report)?);
 
     if !report.passed {
-        bail!("live smoke did not observe both CLOB and Coinbase ticks");
+        bail!("live smoke did not observe CLOB, Coinbase, and all configured outcomes");
     }
 
     Ok(())
-}
-
-fn path_with_extension_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let extension = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or("ndjson");
-    path.with_extension(format!("{suffix}.{extension}"))
 }
 
 fn remove_if_exists(path: &Path) -> anyhow::Result<()> {
@@ -90,6 +83,7 @@ fn combine_reports(
     reference_path: &Path,
     market_report: &LiveSmokeReport,
     reference_report: &LiveSmokeReport,
+    required_outcomes: &[&str],
 ) -> LiveSmokeReport {
     let mut outcomes = BTreeSet::new();
     outcomes.extend(market_report.outcomes.iter().cloned());
@@ -97,6 +91,8 @@ fn combine_reports(
     let market_ticks = market_report.market_ticks + reference_report.market_ticks;
     let reference_ticks = market_report.reference_ticks + reference_report.reference_ticks;
     let stale_states = market_report.stale_states + reference_report.stale_states;
+    let outcomes: Vec<String> = outcomes.into_iter().collect();
+    let passed = live_smoke_passed(market_ticks, reference_ticks, &outcomes, required_outcomes);
 
     LiveSmokeReport {
         slug: slug.to_string(),
@@ -105,7 +101,7 @@ fn combine_reports(
         market_ticks,
         reference_ticks,
         stale_states,
-        outcomes: outcomes.into_iter().collect(),
+        outcomes,
         first_tick_timestamp_ms: min_optional(
             market_report.first_tick_timestamp_ms,
             reference_report.first_tick_timestamp_ms,
@@ -114,7 +110,7 @@ fn combine_reports(
             market_report.last_tick_timestamp_ms,
             reference_report.last_tick_timestamp_ms,
         ),
-        passed: market_ticks > 0 && reference_ticks > 0,
+        passed,
     }
 }
 

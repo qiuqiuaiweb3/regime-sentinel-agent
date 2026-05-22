@@ -11,6 +11,7 @@ use std::{env, net::SocketAddr, path::PathBuf};
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt::init();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let host = env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
     let port = env::var("PORT").unwrap_or_else(|_| "8080".to_string());
@@ -20,16 +21,21 @@ async fn main() -> anyhow::Result<()> {
 
     if collector_config.enabled {
         let collector_store = mongo_store_from_env("live collector").await?;
-        let market_config = collector_config.clone();
+        let market_config = collector_config
+            .clone()
+            .with_ndjson_path(collector_config.ndjson_path_for_role("market"));
         let market_store = collector_store.clone();
         tokio::spawn(async move {
             if let Err(error) = run_live_collector(market_config, market_store).await {
                 tracing::error!(?error, "live collector stopped");
             }
         });
+        let reference_config = collector_config
+            .clone()
+            .with_ndjson_path(collector_config.ndjson_path_for_role("reference"));
         tokio::spawn(async move {
             if let Err(error) =
-                run_reference_price_collector(collector_config, collector_store).await
+                run_reference_price_collector(reference_config, collector_store).await
             {
                 tracing::error!(?error, "reference price collector stopped");
             }
