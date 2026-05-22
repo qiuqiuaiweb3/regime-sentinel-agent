@@ -31,3 +31,13 @@ fn bootstrap_plan_skips_existing_collections_but_keeps_index_targets() {
         "feature_windows_vector_search"
     );
 }
+
+#[test]
+fn bootstrap_summary_counts_planned_resources() {
+    let plan = regime_service::mongo_bootstrap::mongo_bootstrap_plan(Vec::new());
+    let summary = regime_service::mongo_bootstrap::MongoBootstrapSummary::from_plan(&plan);
+
+    assert_eq!(summary.collections_created, 6);
+    assert_eq!(summary.regular_indexes_requested, 6);
+    assert_eq!(summary.vector_search_indexes_requested, 1);
+}

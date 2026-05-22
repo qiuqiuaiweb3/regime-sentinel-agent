@@ -170,6 +170,9 @@ pub mod similar_windows {
 pub mod mongo_bootstrap {
     use std::collections::HashSet;
 
+    use mongodb::{Database, bson::Document};
+    use serde::Serialize;
+
     use crate::mongo_indexes::{
         collection_create_models, regular_index_models, vector_search_index_models,
     };
@@ -185,6 +188,23 @@ pub mod mongo_bootstrap {
         pub collections_to_create: Vec<&'static str>,
         pub regular_indexes_to_create: Vec<BootstrapIndexTarget>,
         pub vector_search_indexes_to_create: Vec<BootstrapIndexTarget>,
+    }
+
+    #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+    pub struct MongoBootstrapSummary {
+        pub collections_created: usize,
+        pub regular_indexes_requested: usize,
+        pub vector_search_indexes_requested: usize,
+    }
+
+    impl MongoBootstrapSummary {
+        pub fn from_plan(plan: &MongoBootstrapPlan) -> Self {
+            Self {
+                collections_created: plan.collections_to_create.len(),
+                regular_indexes_requested: plan.regular_indexes_to_create.len(),
+                vector_search_indexes_requested: plan.vector_search_indexes_to_create.len(),
+            }
+        }
     }
 
     pub fn mongo_bootstrap_plan(
@@ -224,6 +244,41 @@ pub mod mongo_bootstrap {
             regular_indexes_to_create,
             vector_search_indexes_to_create,
         }
+    }
+
+    pub async fn bootstrap_mongodb(db: &Database) -> mongodb::error::Result<MongoBootstrapSummary> {
+        let existing_collection_names = db.list_collection_names().await?;
+        let plan = mongo_bootstrap_plan(existing_collection_names);
+
+        for model in collection_create_models()
+            .into_iter()
+            .filter(|model| plan.collections_to_create.contains(&model.collection_name))
+        {
+            let mut create = db.create_collection(model.collection_name);
+            if let Some(options) = model.options {
+                if let Some(timeseries) = options.timeseries {
+                    create = create.timeseries(timeseries);
+                }
+                if let Some(expire_after_seconds) = options.expire_after_seconds {
+                    create = create.expire_after_seconds(expire_after_seconds);
+                }
+            }
+            create.await?;
+        }
+
+        for model in regular_index_models() {
+            db.collection::<Document>(model.collection_name)
+                .create_index(model.index)
+                .await?;
+        }
+
+        for model in vector_search_index_models() {
+            db.collection::<Document>(model.collection_name)
+                .create_search_index(model.index)
+                .await?;
+        }
+
+        Ok(MongoBootstrapSummary::from_plan(&plan))
     }
 }
 
