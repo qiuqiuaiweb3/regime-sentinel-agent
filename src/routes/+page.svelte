@@ -14,40 +14,44 @@
     LineStyle,
     createChart,
     type IChartApi,
-    type UTCTimestamp
+    type ISeriesApi
   } from 'lightweight-charts';
-
-  type AlertRow = {
-    time: string;
-    state: string;
-    lead: string;
-    score: string;
-  };
-
-  const priceData = [
-    { time: 1769000000 as UTCTimestamp, value: 0.5 },
-    { time: 1769000075 as UTCTimestamp, value: 0.54 },
-    { time: 1769000100 as UTCTimestamp, value: 0.62 },
-    { time: 1769000400 as UTCTimestamp, value: 0.61 }
-  ];
-
-  const fairData = [
-    { time: 1769000000 as UTCTimestamp, value: 0.49 },
-    { time: 1769000075 as UTCTimestamp, value: 0.49 },
-    { time: 1769000100 as UTCTimestamp, value: 0.51 },
-    { time: 1769000400 as UTCTimestamp, value: 0.52 }
-  ];
-
-  const alertRows: AlertRow[] = [
-    { time: '00:01.750', state: 'EARLY_RISK', lead: '+250 ms', score: '1.94' },
-    { time: '00:05.000', state: 'WATCH', lead: 'pending', score: '0.68' }
-  ];
+  import {
+    fallbackDashboardSnapshot,
+    fetchDashboardSnapshot,
+    snapshotToDashboardView,
+    type DashboardSnapshot
+  } from '$lib/dashboard';
 
   let chartElement: HTMLDivElement;
   let chart: IChartApi | undefined;
+  let priceSeries: ISeriesApi<'Line'> | undefined;
+  let fairSeries: ISeriesApi<'Line'> | undefined;
+  let snapshot: DashboardSnapshot = fallbackDashboardSnapshot;
+  let dashboardView = snapshotToDashboardView(snapshot);
   let horizon = '1s';
-  let geminiEnabled = false;
-  let runState = 'ready';
+  let geminiEnabled = dashboardView.geminiEnabled;
+  let runState = 'fallback';
+
+  function applySnapshot(nextSnapshot: DashboardSnapshot) {
+    snapshot = nextSnapshot;
+    dashboardView = snapshotToDashboardView(snapshot);
+    geminiEnabled = dashboardView.geminiEnabled;
+    priceSeries?.setData(dashboardView.priceData);
+    fairSeries?.setData(dashboardView.fairData);
+    priceSeries?.setMarkers(dashboardView.markers);
+    chart?.timeScale().fitContent();
+  }
+
+  async function refreshDashboard() {
+    runState = 'loading';
+    try {
+      applySnapshot(await fetchDashboardSnapshot(fetch));
+      runState = 'snapshot';
+    } catch {
+      runState = 'fallback';
+    }
+  }
 
   onMount(() => {
     chart = createChart(chartElement, {
@@ -72,43 +76,50 @@
       }
     });
 
-    const priceSeries = chart.addLineSeries({
+    priceSeries = chart.addLineSeries({
       color: '#1d4ed8',
       lineWidth: 2,
       priceLineVisible: false
     });
-    const fairSeries = chart.addLineSeries({
+    fairSeries = chart.addLineSeries({
       color: '#0f766e',
       lineWidth: 2,
       lineStyle: LineStyle.Dashed,
       priceLineVisible: false
     });
 
-    priceSeries.setData(priceData);
-    fairSeries.setData(fairData);
-    priceSeries.setMarkers([
-      {
-        time: 1769000075 as UTCTimestamp,
-        position: 'aboveBar',
-        color: '#b91c1c',
-        shape: 'arrowDown',
-        text: 'EARLY_RISK +250ms'
-      }
-    ]);
-    chart.timeScale().fitContent();
+    applySnapshot(snapshot);
 
     const resize = () => chart?.applyOptions({ width: chartElement.clientWidth });
     resize();
     window.addEventListener('resize', resize);
+    void refreshDashboard();
+
+    const events = new EventSource('/api/dashboard/events');
+    events.addEventListener('snapshot', (event) => {
+      try {
+        applySnapshot(JSON.parse((event as MessageEvent).data) as DashboardSnapshot);
+        runState = 'streaming';
+      } catch {
+        runState = 'stream-error';
+      }
+    });
+    events.onerror = () => {
+      if (runState !== 'streaming') {
+        runState = 'fallback';
+      }
+    };
 
     return () => {
       window.removeEventListener('resize', resize);
+      events.close();
       chart?.remove();
     };
   });
 
   function replay() {
     runState = 'replayed';
+    void refreshDashboard();
   }
 </script>
 
@@ -132,6 +143,7 @@
         <button
           class="inline-flex h-9 items-center gap-2 rounded-md border border-slate-300 bg-white px-3 text-sm font-medium text-slate-700 hover:bg-slate-50"
           type="button"
+          on:click={refreshDashboard}
           aria-label="Refresh data"
         >
           <RefreshCw size={16} />
@@ -158,14 +170,15 @@
             <span>State</span>
             <AlertTriangle size={16} class="text-red-700" />
           </div>
-          <p class="mt-2 text-xl font-semibold text-red-700">EARLY_RISK</p>
+          <p class="mt-2 text-xl font-semibold text-red-700">{dashboardView.state}</p>
+          <p class="mt-1 text-xs text-slate-500">{dashboardView.confidence}</p>
         </div>
         <div class="rounded-md border border-slate-200 bg-white p-4">
           <div class="flex items-center justify-between text-xs uppercase text-slate-500">
             <span>Lead Time</span>
             <BarChart3 size={16} class="text-blue-700" />
           </div>
-          <p class="mt-2 text-xl font-semibold text-slate-950">+250 ms</p>
+          <p class="mt-2 text-xl font-semibold text-slate-950">{dashboardView.currentLead}</p>
         </div>
         <div class="rounded-md border border-slate-200 bg-white p-4">
           <div class="flex items-center justify-between text-xs uppercase text-slate-500">
@@ -215,7 +228,7 @@
           <h2 class="text-sm font-semibold text-slate-950">Alerts</h2>
         </div>
         <div class="divide-y divide-slate-200">
-          {#each alertRows as row}
+          {#each dashboardView.alertRows as row}
             <div class="grid grid-cols-[1fr_auto] gap-3 px-4 py-3">
               <div>
                 <p class="text-sm font-medium text-slate-950">{row.state}</p>
@@ -225,6 +238,8 @@
                 {row.lead}
               </span>
             </div>
+          {:else}
+            <p class="px-4 py-3 text-sm text-slate-500">No alerts</p>
           {/each}
         </div>
       </section>
@@ -241,8 +256,7 @@
           </label>
         </div>
         <p class="mt-4 text-sm leading-6 text-slate-700">
-          Fair gap and OFI rose before the full price move. Historical windows with similar pressure
-          usually resolved within the next 1s to 5s horizon.
+          {dashboardView.geminiSummary}
         </p>
       </section>
 

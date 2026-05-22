@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "vite build",
-    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"
+    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+    "test": "vitest"
   },
   "dependencies": {
     "@lucide/svelte": "1.16.0",
@@ -22,6 +23,7 @@
     "svelte-check": "4.1.1",
     "tailwindcss": "3.4.17",
     "typescript": "5.7.2",
-    "vite": "8.0.14"
+    "vite": "8.0.14",
+    "vitest": "4.1.7"
   }
 }
