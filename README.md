@@ -34,6 +34,12 @@ cargo test
 
 Do not commit `.env` or local secret files.
 
+Initialize MongoDB collections and indexes explicitly after `.env` is configured:
+
+```bash
+cargo run -p regime-service --bin init_mongodb
+```
+
 ## Environment
 
 Required later for live/cloud runs:
