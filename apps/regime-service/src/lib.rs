@@ -284,7 +284,7 @@ pub mod mongo_bootstrap {
 
 pub mod mongo_documents {
     use mongodb::bson::{Bson, DateTime, Document, doc};
-    use regime_core::FeatureWindowRecord;
+    use regime_core::{FeatureWindowRecord, MarketTickRecord};
 
     #[derive(Debug, Clone)]
     pub struct MongoInsertDocument {
@@ -296,6 +296,13 @@ pub mod mongo_documents {
         MongoInsertDocument {
             collection_name: "feature_windows",
             document: feature_window_document(window),
+        }
+    }
+
+    pub fn market_tick_insert(tick: &MarketTickRecord) -> MongoInsertDocument {
+        MongoInsertDocument {
+            collection_name: "market_ticks",
+            document: market_tick_document(tick),
         }
     }
 
@@ -321,13 +328,29 @@ pub mod mongo_documents {
             "feature_vector": feature_vector,
         }
     }
+
+    pub fn market_tick_document(tick: &MarketTickRecord) -> Document {
+        doc! {
+            "timestamp": DateTime::from_millis(tick.timestamp_ms),
+            "meta": {
+                "slug": &tick.meta.slug,
+                "series": &tick.meta.series,
+                "source": &tick.meta.source,
+            },
+            "price": tick.price,
+            "size": tick.size,
+            "side": &tick.side,
+            "outcome": &tick.outcome,
+            "receive_lag_ms": tick.receive_lag_ms,
+        }
+    }
 }
 
 pub mod mongo_store {
     use mongodb::{Database, bson::Document};
-    use regime_core::FeatureWindowRecord;
+    use regime_core::{FeatureWindowRecord, MarketTickRecord};
 
-    use crate::mongo_documents::feature_window_insert;
+    use crate::mongo_documents::{feature_window_insert, market_tick_insert};
 
     #[derive(Debug, Clone)]
     pub struct MongoStore {
@@ -344,6 +367,19 @@ pub mod mongo_store {
             window: &FeatureWindowRecord,
         ) -> mongodb::error::Result<()> {
             let insert = feature_window_insert(window);
+            self.db
+                .collection::<Document>(insert.collection_name)
+                .insert_one(insert.document)
+                .await?;
+
+            Ok(())
+        }
+
+        pub async fn insert_market_tick(
+            &self,
+            tick: &MarketTickRecord,
+        ) -> mongodb::error::Result<()> {
+            let insert = market_tick_insert(tick);
             self.db
                 .collection::<Document>(insert.collection_name)
                 .insert_one(insert.document)

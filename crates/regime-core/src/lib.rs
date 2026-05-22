@@ -41,6 +41,24 @@ pub struct FeatureWindowRecord {
     pub feature_vector: [f64; 5],
 }
 
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MarketTickMeta {
+    pub slug: String,
+    pub series: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
+pub struct MarketTickRecord {
+    pub timestamp_ms: i64,
+    pub meta: MarketTickMeta,
+    pub price: f64,
+    pub size: f64,
+    pub side: String,
+    pub outcome: String,
+    pub receive_lag_ms: i64,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Serialize)]
 pub struct ScoreWeights {
     pub fair_gap_velocity: f64,

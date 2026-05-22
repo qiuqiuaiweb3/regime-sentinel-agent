@@ -1,5 +1,5 @@
 use mongodb::bson::Bson;
-use regime_core::{FeatureWindowMetrics, build_feature_window};
+use regime_core::{FeatureWindowMetrics, MarketTickMeta, MarketTickRecord, build_feature_window};
 
 #[test]
 fn feature_window_document_matches_mongodb_schema_fields() {
@@ -58,4 +58,43 @@ fn feature_window_insert_targets_feature_windows_collection() {
 
     assert_eq!(insert.collection_name, "feature_windows");
     assert_eq!(insert.document.get_str("slug"), Ok("btc-updown-5m"));
+}
+
+#[test]
+fn market_tick_insert_matches_time_series_schema() {
+    let tick = MarketTickRecord {
+        timestamp_ms: 1_769_000_000_123,
+        meta: MarketTickMeta {
+            slug: "btc-updown-5m".to_string(),
+            series: "btc-updown-5m".to_string(),
+            source: "clob".to_string(),
+        },
+        price: 0.52,
+        size: 100.0,
+        side: "BUY".to_string(),
+        outcome: "UP".to_string(),
+        receive_lag_ms: 120,
+    };
+
+    let insert = regime_service::mongo_documents::market_tick_insert(&tick);
+
+    assert_eq!(insert.collection_name, "market_ticks");
+    assert_eq!(
+        insert
+            .document
+            .get_datetime("timestamp")
+            .map(|value| value.timestamp_millis()),
+        Ok(1_769_000_000_123)
+    );
+    assert_eq!(
+        insert
+            .document
+            .get_document("meta")
+            .and_then(|meta| meta.get_str("slug")),
+        Ok("btc-updown-5m")
+    );
+    assert_eq!(insert.document.get_f64("price"), Ok(0.52));
+    assert_eq!(insert.document.get_f64("size"), Ok(100.0));
+    assert_eq!(insert.document.get_str("side"), Ok("BUY"));
+    assert_eq!(insert.document.get_i64("receive_lag_ms"), Ok(120));
 }
