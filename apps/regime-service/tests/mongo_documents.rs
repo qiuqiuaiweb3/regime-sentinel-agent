@@ -37,3 +37,25 @@ fn feature_window_document_matches_mongodb_schema_fields() {
     assert_eq!(feature_vector[1], Bson::Double(0.42));
     assert_eq!(feature_vector[4], Bson::Double(2.1));
 }
+
+#[test]
+fn feature_window_insert_targets_feature_windows_collection() {
+    let window = build_feature_window(
+        "btc-updown-5m",
+        FeatureWindowMetrics {
+            window_ts_ms: 1_769_000_000_000,
+            window_ms: 1_000,
+            p_mid: 0.52,
+            p_fair: 0.49,
+            ofi_1s: 0.42,
+            depth_imbalance: 0.31,
+            spread: 0.03,
+            volume_acceleration: 2.1,
+        },
+    );
+
+    let insert = regime_service::mongo_documents::feature_window_insert(&window);
+
+    assert_eq!(insert.collection_name, "feature_windows");
+    assert_eq!(insert.document.get_str("slug"), Ok("btc-updown-5m"));
+}

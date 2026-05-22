@@ -286,6 +286,19 @@ pub mod mongo_documents {
     use mongodb::bson::{Bson, DateTime, Document, doc};
     use regime_core::FeatureWindowRecord;
 
+    #[derive(Debug, Clone)]
+    pub struct MongoInsertDocument {
+        pub collection_name: &'static str,
+        pub document: Document,
+    }
+
+    pub fn feature_window_insert(window: &FeatureWindowRecord) -> MongoInsertDocument {
+        MongoInsertDocument {
+            collection_name: "feature_windows",
+            document: feature_window_document(window),
+        }
+    }
+
     pub fn feature_window_document(window: &FeatureWindowRecord) -> Document {
         let feature_vector = window
             .feature_vector
@@ -306,6 +319,37 @@ pub mod mongo_documents {
             "spread": window.spread,
             "volume_acceleration": window.volume_acceleration,
             "feature_vector": feature_vector,
+        }
+    }
+}
+
+pub mod mongo_store {
+    use mongodb::{Database, bson::Document};
+    use regime_core::FeatureWindowRecord;
+
+    use crate::mongo_documents::feature_window_insert;
+
+    #[derive(Debug, Clone)]
+    pub struct MongoStore {
+        db: Database,
+    }
+
+    impl MongoStore {
+        pub fn new(db: Database) -> Self {
+            Self { db }
+        }
+
+        pub async fn insert_feature_window(
+            &self,
+            window: &FeatureWindowRecord,
+        ) -> mongodb::error::Result<()> {
+            let insert = feature_window_insert(window);
+            self.db
+                .collection::<Document>(insert.collection_name)
+                .insert_one(insert.document)
+                .await?;
+
+            Ok(())
         }
     }
 }
