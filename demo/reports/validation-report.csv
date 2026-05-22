@@ -1,0 +1,2 @@
+alert_time_ms,shift_onset_time_ms,lead_time_ms,horizon_ms,timing
+750,1000,250,1000,Early

@@ -1,0 +1,58 @@
+{
+  "price_points": [
+    { "timestamp_ms": 0, "p_mid": 0.5 },
+    { "timestamp_ms": 1000, "p_mid": 0.62 },
+    { "timestamp_ms": 4000, "p_mid": 0.61 },
+    { "timestamp_ms": 5000, "p_mid": 0.65 },
+    { "timestamp_ms": 8000, "p_mid": 0.64 },
+    { "timestamp_ms": 30000, "p_mid": 0.7 },
+    { "timestamp_ms": 33000, "p_mid": 0.69 }
+  ],
+  "feature_windows": [
+    {
+      "slug": "btc-updown-5m-demo",
+      "window_ts_ms": 0,
+      "window_ms": 1000,
+      "p_mid": 0.5,
+      "p_fair": 0.49,
+      "fair_gap": 0.01,
+      "ofi_1s": 0.01,
+      "depth_imbalance": 0.01,
+      "spread": 0.02,
+      "volume_acceleration": 0.01,
+      "feature_vector": [0.01, 0.01, 0.01, 0.02, 0.01]
+    },
+    {
+      "slug": "btc-updown-5m-demo",
+      "window_ts_ms": 750,
+      "window_ms": 1000,
+      "p_mid": 0.54,
+      "p_fair": 0.49,
+      "fair_gap": 0.05,
+      "ofi_1s": 0.42,
+      "depth_imbalance": 0.31,
+      "spread": 0.03,
+      "volume_acceleration": 2.1,
+      "feature_vector": [0.05, 0.42, 0.31, 0.03, 2.1]
+    }
+  ],
+  "score_weights": {
+    "fair_gap_velocity": 4.0,
+    "depth_imbalance": 1.0,
+    "ofi_1s": 1.0,
+    "volume_acceleration": 0.5,
+    "stale_data_penalty": 1.0
+  },
+  "score_thresholds": {
+    "watch": 1.0,
+    "early_risk": 1.0,
+    "shift_detected_move": 0.1
+  },
+  "alert_horizon_ms": 1000,
+  "label_config": {
+    "horizons_ms": [1000, 5000, 30000],
+    "min_move": 0.1,
+    "persist_ms": 3000
+  },
+  "synchronous_tolerance_ms": 100
+}

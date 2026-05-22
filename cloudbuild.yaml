@@ -3,6 +3,7 @@ substitutions:
   _SERVICE: regime-sentinel-agent
   _REPOSITORY: regime-sentinel
   _IMAGE: regime-service
+  _SERVICE_ACCOUNT: 998092298764-compute@developer.gserviceaccount.com
 
 steps:
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
@@ -37,6 +38,13 @@ steps:
       - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE}:$BUILD_ID
       - --region=${_REGION}
       - --platform=managed
+      - --service-account=${_SERVICE_ACCOUNT}
+      - --cpu=1
+      - --memory=1Gi
+      - --min-instances=1
+      - --max-instances=1
+      - --concurrency=80
+      - --timeout=3600s
       - --set-env-vars=GOOGLE_CLOUD_PROJECT=$PROJECT_ID,GOOGLE_CLOUD_REGION=${_REGION},LIVE_COLLECTOR_ENABLED=false,GEMINI_ENABLED=false,REGIME_STATIC_DIR=/app/build
       - --set-secrets=MONGODB_URI=mongodb-uri:latest,MONGODB_DB=mongodb-db:latest
 

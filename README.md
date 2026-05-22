@@ -100,6 +100,40 @@ Useful local endpoints:
 - `http://127.0.0.1:8080/api/dashboard/events`
 - `http://127.0.0.1:8080/api/openapi.json`
 
+## Replay Demo Artifacts
+
+The fixed high-volatility replay window is stored at:
+
+```text
+demo/replay/high-volatility-btc-window.json
+```
+
+Regenerate the JSON validation report:
+
+```bash
+cargo run -q -p regime-replay -- \
+  --input demo/replay/high-volatility-btc-window.json | jq . \
+  > demo/reports/validation-report.json
+```
+
+Regenerate the CSV alert timing report:
+
+```bash
+cargo run -q -p regime-replay -- \
+  --input demo/replay/high-volatility-btc-window.json \
+  --format csv \
+  > demo/reports/validation-report.csv
+```
+
+The checked-in sample `backtest_runs` document is:
+
+```text
+demo/reports/backtest-run.sample.json
+```
+
+The current sample emits one early alert at `750ms` for a shift onset at `1000ms`,
+with `250ms` lead time.
+
 ## Google Cloud Run
 
 The deployment target is Tokyo:
@@ -113,6 +147,16 @@ The Cloud Build file creates an Artifact Registry Docker repository in
 `asia-northeast1`, builds the SvelteKit static frontend and Rust service image,
 pushes the image, and deploys Cloud Run with `LIVE_COLLECTOR_ENABLED=false` and
 `GEMINI_ENABLED=false`.
+
+Cloud Run resource settings are explicit in `cloudbuild.yaml`:
+
+- region: `asia-northeast1`
+- service account: `998092298764-compute@developer.gserviceaccount.com`
+- CPU / memory: `1` vCPU / `1Gi`
+- instances: min `1`, max `1`
+- concurrency: `80`
+- request timeout: `3600s`
+- Secret Manager injection: `mongodb-uri`, `mongodb-db`
 
 Current hosted URL:
 

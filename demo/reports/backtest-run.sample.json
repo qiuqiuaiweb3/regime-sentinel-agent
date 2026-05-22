@@ -1,0 +1,111 @@
+{
+  "created_at_ms": 1769000000750,
+  "parameters": {
+    "score_weights": {
+      "fair_gap_velocity": 4.0,
+      "depth_imbalance": 1.0,
+      "ofi_1s": 1.0,
+      "volume_acceleration": 0.5,
+      "stale_data_penalty": 1.0
+    },
+    "score_thresholds": {
+      "watch": 1.0,
+      "early_risk": 1.0,
+      "shift_detected_move": 0.1
+    },
+    "label_config": {
+      "horizons_ms": [
+        1000,
+        5000,
+        30000
+      ],
+      "min_move": 0.1,
+      "persist_ms": 3000
+    },
+    "alert_horizon_ms": 1000,
+    "synchronous_tolerance_ms": 100
+  },
+  "data_range": {
+    "window_id": "high-volatility-btc-window",
+    "input": "demo/replay/high-volatility-btc-window.json",
+    "labels_generated": 3
+  },
+  "metrics": {
+    "median_lead_time_ms": 250.0,
+    "p75_lead_time_ms": 250.0,
+    "precision": 1.0,
+    "recall": 0.3333333333333333,
+    "false_alerts_per_market": [
+      {
+        "market_slug": "btc-updown-5m-demo",
+        "false_alerts": 0
+      }
+    ],
+    "horizon_pr_auc": [
+      {
+        "horizon_ms": 1000,
+        "pr_auc": 1.0
+      },
+      {
+        "horizon_ms": 5000,
+        "pr_auc": 0.0
+      },
+      {
+        "horizon_ms": 30000,
+        "pr_auc": 0.0
+      }
+    ]
+  },
+  "ablation": [
+    {
+      "variant": "baseline",
+      "total_alerts": 1,
+      "early": 1,
+      "synchronous": 0,
+      "late": 0,
+      "false_alerts": 0,
+      "precision": 1.0,
+      "recall": 0.3333333333333333
+    },
+    {
+      "variant": "without_fair_gap_velocity",
+      "total_alerts": 1,
+      "early": 1,
+      "synchronous": 0,
+      "late": 0,
+      "false_alerts": 0,
+      "precision": 1.0,
+      "recall": 0.3333333333333333
+    },
+    {
+      "variant": "without_depth_imbalance",
+      "total_alerts": 1,
+      "early": 1,
+      "synchronous": 0,
+      "late": 0,
+      "false_alerts": 0,
+      "precision": 1.0,
+      "recall": 0.3333333333333333
+    },
+    {
+      "variant": "without_ofi_1s",
+      "total_alerts": 1,
+      "early": 1,
+      "synchronous": 0,
+      "late": 0,
+      "false_alerts": 0,
+      "precision": 1.0,
+      "recall": 0.3333333333333333
+    },
+    {
+      "variant": "without_volume_acceleration",
+      "total_alerts": 0,
+      "early": 0,
+      "synchronous": 0,
+      "late": 0,
+      "false_alerts": 0,
+      "precision": 0.0,
+      "recall": 0.0
+    }
+  ]
+}
