@@ -1,0 +1,17 @@
+target/
+node_modules/
+dist/
+build/
+.svelte-kit/
+
+.env
+.env.*
+!.env.example
+LOCAL_ENVIRONMENT.md
+
+*.log
+*.tmp
+*.ndjson
+*.sqlite3
+
+.DS_Store
