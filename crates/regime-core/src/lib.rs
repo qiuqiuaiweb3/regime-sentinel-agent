@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -204,9 +205,44 @@ pub struct ValidationSummary {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
+pub struct FalseAlertsByMarket {
+    pub market_slug: String,
+    pub false_alerts: usize,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Serialize)]
+pub struct HorizonPrAuc {
+    pub horizon_ms: i64,
+    pub pr_auc: f64,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
+pub struct ValidationMetrics {
+    pub median_lead_time_ms: Option<f64>,
+    pub p75_lead_time_ms: Option<f64>,
+    pub precision: f64,
+    pub recall: f64,
+    pub false_alerts_per_market: Vec<FalseAlertsByMarket>,
+    pub horizon_pr_auc: Vec<HorizonPrAuc>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 pub struct ValidationReport {
     pub results: Vec<AlertValidationResult>,
     pub summary: ValidationSummary,
+    pub metrics: ValidationMetrics,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
+pub struct AblationMetric {
+    pub variant: String,
+    pub total_alerts: usize,
+    pub early: usize,
+    pub synchronous: usize,
+    pub late: usize,
+    pub false_alerts: usize,
+    pub precision: f64,
+    pub recall: f64,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
@@ -359,6 +395,66 @@ pub fn generate_alerts_from_feature_windows(
         .collect()
 }
 
+pub fn ablation_report_from_feature_windows(
+    windows: &[FeatureWindowRecord],
+    labels: &[ShiftLabel],
+    weights: &ScoreWeights,
+    thresholds: &ScoreThresholds,
+    horizon_ms: i64,
+    synchronous_tolerance_ms: i64,
+) -> Vec<AblationMetric> {
+    let variants = [
+        ("baseline", *weights),
+        (
+            "without_fair_gap_velocity",
+            ScoreWeights {
+                fair_gap_velocity: 0.0,
+                ..*weights
+            },
+        ),
+        (
+            "without_depth_imbalance",
+            ScoreWeights {
+                depth_imbalance: 0.0,
+                ..*weights
+            },
+        ),
+        (
+            "without_ofi_1s",
+            ScoreWeights {
+                ofi_1s: 0.0,
+                ..*weights
+            },
+        ),
+        (
+            "without_volume_acceleration",
+            ScoreWeights {
+                volume_acceleration: 0.0,
+                ..*weights
+            },
+        ),
+    ];
+
+    variants
+        .into_iter()
+        .map(|(variant, weights)| {
+            let alerts =
+                generate_alerts_from_feature_windows(windows, &weights, thresholds, horizon_ms);
+            let report = validate_alerts(&alerts, labels, synchronous_tolerance_ms);
+            AblationMetric {
+                variant: variant.to_string(),
+                total_alerts: report.summary.total_alerts,
+                early: report.summary.early,
+                synchronous: report.summary.synchronous,
+                late: report.summary.late,
+                false_alerts: report.summary.false_alerts,
+                precision: report.metrics.precision,
+                recall: report.metrics.recall,
+            }
+        })
+        .collect()
+}
+
 pub fn generate_shift_labels(points: &[PricePoint], config: &ShiftLabelConfig) -> Vec<ShiftLabel> {
     let mut labels = Vec::new();
 
@@ -411,6 +507,15 @@ pub fn validate_alerts(
     labels: &[ShiftLabel],
     synchronous_tolerance_ms: i64,
 ) -> ValidationReport {
+    validate_alerts_for_market("unknown", alerts, labels, synchronous_tolerance_ms)
+}
+
+pub fn validate_alerts_for_market(
+    market_slug: impl Into<String>,
+    alerts: &[AlertRecord],
+    labels: &[ShiftLabel],
+    synchronous_tolerance_ms: i64,
+) -> ValidationReport {
     let mut results = Vec::with_capacity(alerts.len());
     let mut summary = ValidationSummary {
         total_alerts: alerts.len(),
@@ -454,7 +559,13 @@ pub fn validate_alerts(
         });
     }
 
-    ValidationReport { results, summary }
+    let metrics = validation_metrics(market_slug.into(), alerts, labels, &results, &summary);
+
+    ValidationReport {
+        results,
+        summary,
+        metrics,
+    }
 }
 
 pub fn mongo_collection_names() -> [&'static str; 6] {
@@ -573,6 +684,131 @@ fn nearest_label_for_horizon<'a>(
 ) -> Option<&'a ShiftLabel> {
     labels
         .iter()
+        .filter(|label| label.horizon_ms == alert.horizon_ms)
+        .min_by_key(|label| (label.onset_time_ms - alert.timestamp_ms).abs())
+}
+
+fn validation_metrics(
+    market_slug: String,
+    alerts: &[AlertRecord],
+    labels: &[ShiftLabel],
+    results: &[AlertValidationResult],
+    summary: &ValidationSummary,
+) -> ValidationMetrics {
+    let lead_times: Vec<i64> = results
+        .iter()
+        .filter_map(|result| result.lead_time_ms)
+        .collect();
+    let matched_alerts = summary.early + summary.synchronous + summary.late;
+    let matched_labels: BTreeSet<(i64, i64)> = results
+        .iter()
+        .filter_map(|result| {
+            result
+                .shift_onset_time_ms
+                .map(|onset| (result.horizon_ms, onset))
+        })
+        .collect();
+
+    ValidationMetrics {
+        median_lead_time_ms: percentile(&lead_times, 0.50),
+        p75_lead_time_ms: percentile(&lead_times, 0.75),
+        precision: ratio(matched_alerts, alerts.len()),
+        recall: ratio(matched_labels.len(), labels.len()),
+        false_alerts_per_market: vec![FalseAlertsByMarket {
+            market_slug,
+            false_alerts: summary.false_alerts,
+        }],
+        horizon_pr_auc: horizon_pr_auc(alerts, labels),
+    }
+}
+
+fn percentile(values: &[i64], quantile: f64) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+
+    let mut values = values.to_vec();
+    values.sort_unstable();
+
+    if quantile == 0.50 && values.len().is_multiple_of(2) {
+        let upper = values.len() / 2;
+        let lower = upper - 1;
+        return Some((values[lower] as f64 + values[upper] as f64) / 2.0);
+    }
+
+    let index = ((values.len() as f64 * quantile).ceil() as usize).saturating_sub(1);
+    values.get(index).map(|value| *value as f64)
+}
+
+fn ratio(numerator: usize, denominator: usize) -> f64 {
+    if denominator == 0 {
+        return 0.0;
+    }
+
+    numerator as f64 / denominator as f64
+}
+
+fn horizon_pr_auc(alerts: &[AlertRecord], labels: &[ShiftLabel]) -> Vec<HorizonPrAuc> {
+    let horizons: BTreeSet<i64> = labels.iter().map(|label| label.horizon_ms).collect();
+
+    horizons
+        .into_iter()
+        .map(|horizon_ms| {
+            let horizon_labels: Vec<_> = labels
+                .iter()
+                .filter(|label| label.horizon_ms == horizon_ms)
+                .collect();
+            let mut horizon_alerts: Vec<_> = alerts
+                .iter()
+                .filter(|alert| alert.horizon_ms == horizon_ms)
+                .collect();
+            horizon_alerts.sort_by(|left, right| {
+                right
+                    .score
+                    .partial_cmp(&left.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            HorizonPrAuc {
+                horizon_ms,
+                pr_auc: average_precision(&horizon_alerts, &horizon_labels),
+            }
+        })
+        .collect()
+}
+
+fn average_precision(alerts: &[&AlertRecord], labels: &[&ShiftLabel]) -> f64 {
+    if labels.is_empty() || alerts.is_empty() {
+        return 0.0;
+    }
+
+    let mut true_positives = 0_usize;
+    let mut precision_sum = 0.0;
+    let mut matched_labels = BTreeSet::new();
+
+    for (index, alert) in alerts.iter().enumerate() {
+        let Some(label) = nearest_label_for_horizon_refs(alert, labels) else {
+            continue;
+        };
+        let label_key = (label.horizon_ms, label.onset_time_ms);
+        if !matched_labels.insert(label_key) {
+            continue;
+        }
+
+        true_positives += 1;
+        precision_sum += true_positives as f64 / (index + 1) as f64;
+    }
+
+    precision_sum / labels.len() as f64
+}
+
+fn nearest_label_for_horizon_refs<'a>(
+    alert: &AlertRecord,
+    labels: &'a [&ShiftLabel],
+) -> Option<&'a ShiftLabel> {
+    labels
+        .iter()
+        .copied()
         .filter(|label| label.horizon_ms == alert.horizon_ms)
         .min_by_key(|label| (label.onset_time_ms - alert.timestamp_ms).abs())
 }

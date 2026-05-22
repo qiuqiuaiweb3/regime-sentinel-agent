@@ -156,6 +156,7 @@ async fn replay_validation_endpoint_generates_alerts_from_feature_windows() {
     assert_eq!(payload["alerts"][0]["timestamp_ms"], 750);
     assert_eq!(payload["report"]["summary"]["early"], 1);
     assert_eq!(payload["report"]["results"][0]["lead_time_ms"], 250);
+    assert_eq!(payload["ablation"][0]["variant"], "baseline");
 }
 
 #[tokio::test]

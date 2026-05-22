@@ -1,8 +1,8 @@
 use anyhow::{Context, bail};
 use regime_core::{
-    AlertRecord, FeatureWindowRecord, PricePoint, ScoreThresholds, ScoreWeights, ShiftLabel,
-    ShiftLabelConfig, ValidationReport, generate_alerts_from_feature_windows,
-    generate_shift_labels, validate_alerts,
+    AblationMetric, AlertRecord, FeatureWindowRecord, PricePoint, ScoreThresholds, ScoreWeights,
+    ShiftLabel, ShiftLabelConfig, ValidationReport, ablation_report_from_feature_windows,
+    generate_alerts_from_feature_windows, generate_shift_labels, validate_alerts_for_market,
 };
 use serde::{Deserialize, Serialize};
 use std::{env, fs, path::PathBuf};
@@ -26,6 +26,7 @@ struct ReplayOutput {
     alerts: Vec<AlertRecord>,
     labels: Vec<ShiftLabel>,
     report: ValidationReport,
+    ablation: Vec<AblationMetric>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -45,11 +46,18 @@ fn main() -> anyhow::Result<()> {
     let input = read_replay_input(&args.input_path)?;
     let alerts = replay_alerts(&input)?;
     let labels = generate_shift_labels(&input.price_points, &input.label_config);
-    let report = validate_alerts(&alerts, &labels, input.synchronous_tolerance_ms);
+    let report = validate_alerts_for_market(
+        replay_market_slug(&input),
+        &alerts,
+        &labels,
+        input.synchronous_tolerance_ms,
+    );
+    let ablation = replay_ablation(&input, &labels)?;
     let output = ReplayOutput {
         alerts,
         labels,
         report,
+        ablation,
     };
 
     match args.format {
@@ -58,6 +66,42 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn replay_ablation(
+    input: &ReplayInput,
+    labels: &[ShiftLabel],
+) -> anyhow::Result<Vec<AblationMetric>> {
+    if input.feature_windows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let Some(weights) = input.score_weights else {
+        return Ok(Vec::new());
+    };
+    let Some(thresholds) = input.score_thresholds else {
+        return Ok(Vec::new());
+    };
+    let Some(horizon_ms) = input.alert_horizon_ms else {
+        return Ok(Vec::new());
+    };
+
+    Ok(ablation_report_from_feature_windows(
+        &input.feature_windows,
+        labels,
+        &weights,
+        &thresholds,
+        horizon_ms,
+        input.synchronous_tolerance_ms,
+    ))
+}
+
+fn replay_market_slug(input: &ReplayInput) -> &str {
+    input
+        .feature_windows
+        .first()
+        .map(|window| window.slug.as_str())
+        .unwrap_or("replay")
 }
 
 fn replay_alerts(input: &ReplayInput) -> anyhow::Result<Vec<AlertRecord>> {

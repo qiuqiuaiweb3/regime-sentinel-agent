@@ -1,6 +1,7 @@
 use regime_core::{
-    AlertState, FeatureWindowMetrics, ScoreThresholds, ScoreWeights, build_feature_window,
-    feature_snapshot_from_windows, generate_alerts_from_feature_windows,
+    AlertState, FeatureWindowMetrics, ScoreThresholds, ScoreWeights, ShiftDirection, ShiftLabel,
+    ablation_report_from_feature_windows, build_feature_window, feature_snapshot_from_windows,
+    generate_alerts_from_feature_windows,
 };
 
 fn weights() -> ScoreWeights {
@@ -96,4 +97,73 @@ fn generate_alerts_from_feature_windows_emits_non_equilibrium_states() {
     assert_eq!(alerts[0].timestamp_ms, 2_000);
     assert_eq!(alerts[0].state, AlertState::EarlyRisk);
     assert_eq!(alerts[0].horizon_ms, 1_000);
+}
+
+#[test]
+fn ablation_report_shows_metric_drop_when_key_feature_is_removed() {
+    let windows = vec![
+        build_feature_window(
+            "btc-updown-5m",
+            FeatureWindowMetrics {
+                window_ts_ms: 1_000,
+                window_ms: 1_000,
+                p_mid: 0.52,
+                p_fair: 0.51,
+                ofi_1s: 0.0,
+                depth_imbalance: 0.0,
+                spread: 0.02,
+                volume_acceleration: 0.0,
+            },
+        ),
+        build_feature_window(
+            "btc-updown-5m",
+            FeatureWindowMetrics {
+                window_ts_ms: 2_000,
+                window_ms: 1_000,
+                p_mid: 0.55,
+                p_fair: 0.49,
+                ofi_1s: 0.0,
+                depth_imbalance: 0.0,
+                spread: 0.02,
+                volume_acceleration: 0.0,
+            },
+        ),
+    ];
+    let labels = vec![ShiftLabel {
+        baseline_time_ms: 1_500,
+        onset_time_ms: 2_500,
+        horizon_ms: 1_000,
+        direction: ShiftDirection::Up,
+        magnitude: 0.12,
+    }];
+    let weights = ScoreWeights {
+        fair_gap_velocity: 40.0,
+        depth_imbalance: 1.0,
+        ofi_1s: 1.0,
+        volume_acceleration: 1.0,
+        stale_data_penalty: 1.0,
+    };
+
+    let report = ablation_report_from_feature_windows(
+        &windows,
+        &labels,
+        &weights,
+        &thresholds(),
+        1_000,
+        100,
+    );
+
+    let baseline = report
+        .iter()
+        .find(|metric| metric.variant == "baseline")
+        .expect("baseline metric");
+    let without_fair_gap = report
+        .iter()
+        .find(|metric| metric.variant == "without_fair_gap_velocity")
+        .expect("fair gap ablation metric");
+
+    assert_eq!(baseline.total_alerts, 1);
+    assert_eq!(baseline.early, 1);
+    assert_eq!(without_fair_gap.total_alerts, 0);
+    assert_eq!(without_fair_gap.recall, 0.0);
 }

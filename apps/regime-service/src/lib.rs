@@ -6,9 +6,9 @@ use axum::{
 };
 use futures_util::stream;
 use regime_core::{
-    AlertRecord, FeatureWindowRecord, PricePoint, ScoreThresholds, ScoreWeights, ShiftLabel,
-    ShiftLabelConfig, ValidationReport, generate_alerts_from_feature_windows,
-    generate_shift_labels, validate_alerts,
+    AblationMetric, AlertRecord, FeatureWindowRecord, PricePoint, ScoreThresholds, ScoreWeights,
+    ShiftLabel, ShiftLabelConfig, ValidationReport, ablation_report_from_feature_windows,
+    generate_alerts_from_feature_windows, generate_shift_labels, validate_alerts_for_market,
 };
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
@@ -1658,6 +1658,7 @@ pub struct ReplayValidationResponse {
     alerts: Vec<AlertRecord>,
     labels: Vec<ShiftLabel>,
     report: ValidationReport,
+    ablation: Vec<AblationMetric>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1838,13 +1839,54 @@ async fn validate_replay(
 ) -> Result<Json<ReplayValidationResponse>, (StatusCode, String)> {
     let alerts = replay_alerts(&request)?;
     let labels = generate_shift_labels(&request.price_points, &request.label_config);
-    let report = validate_alerts(&alerts, &labels, request.synchronous_tolerance_ms);
+    let report = validate_alerts_for_market(
+        replay_market_slug(&request),
+        &alerts,
+        &labels,
+        request.synchronous_tolerance_ms,
+    );
+    let ablation = replay_ablation(&request, &labels);
 
     Ok(Json(ReplayValidationResponse {
         alerts,
         labels,
         report,
+        ablation,
     }))
+}
+
+fn replay_ablation(
+    request: &ReplayValidationRequest,
+    labels: &[ShiftLabel],
+) -> Vec<AblationMetric> {
+    let (Some(weights), Some(thresholds), Some(horizon_ms)) = (
+        request.score_weights,
+        request.score_thresholds,
+        request.alert_horizon_ms,
+    ) else {
+        return Vec::new();
+    };
+
+    if request.feature_windows.is_empty() {
+        return Vec::new();
+    }
+
+    ablation_report_from_feature_windows(
+        &request.feature_windows,
+        labels,
+        &weights,
+        &thresholds,
+        horizon_ms,
+        request.synchronous_tolerance_ms,
+    )
+}
+
+fn replay_market_slug(request: &ReplayValidationRequest) -> &str {
+    request
+        .feature_windows
+        .first()
+        .map(|window| window.slug.as_str())
+        .unwrap_or("replay")
 }
 
 fn replay_alerts(

@@ -159,5 +159,6 @@ fn replay_cli_generates_alerts_from_feature_windows_when_alerts_are_absent() {
         .success()
         .stdout(contains(r#""timestamp_ms":750"#))
         .stdout(contains(r#""early":1"#))
-        .stdout(contains(r#""lead_time_ms":250"#));
+        .stdout(contains(r#""lead_time_ms":250"#))
+        .stdout(contains(r#""ablation":[{"variant":"baseline""#));
 }
