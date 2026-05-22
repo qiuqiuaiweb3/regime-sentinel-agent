@@ -24,6 +24,8 @@ Current implementation status:
 - Live collector code supports Polymarket CLOB market data, Coinbase BTC reference prices,
   stale-data downgrade, and NDJSON fallback.
 - Gemini calls are disabled by default and cost-limited when enabled.
+- Agent Builder read tools expose current regime, recent alerts, similar windows,
+  backtest metrics, and stored market summaries.
 
 ## Architecture
 
@@ -119,7 +121,12 @@ Useful local endpoints:
 - `http://127.0.0.1:8080/`
 - `http://127.0.0.1:8080/health`
 - `http://127.0.0.1:8080/api/dashboard/snapshot`
+- `http://127.0.0.1:8080/api/dashboard/snapshot?mode=replay`
 - `http://127.0.0.1:8080/api/dashboard/events`
+- `http://127.0.0.1:8080/api/agent/current-regime`
+- `http://127.0.0.1:8080/api/agent/recent-alerts`
+- `http://127.0.0.1:8080/api/agent/backtest-metrics`
+- `http://127.0.0.1:8080/api/agent/market-summary`
 - `http://127.0.0.1:8080/api/openapi.json`
 
 ## Replay Demo Artifacts
@@ -155,6 +162,30 @@ demo/reports/backtest-run.sample.json
 
 The current sample emits one early alert at `750ms` for a shift onset at `1000ms`,
 with `250ms` lead time.
+
+The strict acceptance replay fixture is:
+
+```text
+demo/replay/acceptance-lead-time-window.json
+```
+
+It records deterministic 1s, 5s, and 30s horizon alerts with `1000ms`, `5000ms`,
+and `10000ms` lead time. Its checked-in reports are:
+
+```text
+demo/reports/acceptance-lead-time-report.json
+demo/reports/acceptance-lead-time-report.csv
+```
+
+Run the hot-path latency probe:
+
+```bash
+cargo run -q -p regime-replay --bin latency-probe -- \
+  --input demo/replay/latency-probe-window.json \
+  --samples 256
+```
+
+The checked-in latency artifact is `demo/reports/latency-probe-report.json`.
 
 ## Google Cloud Run
 
@@ -228,9 +259,10 @@ The deployed OpenAPI spec is served from:
 https://regime-sentinel-agent-998092298764.asia-northeast1.run.app/api/openapi.json
 ```
 
-It exposes read/demo-safe operations for health, dashboard snapshot, and replay
-validation. The hosted spec uses OpenAPI `3.0.3`, includes the Cloud Run server
-URL, and declares the replay validation JSON request body.
+It exposes read/demo-safe operations for health, dashboard snapshot, replay
+validation, current regime, recent alerts, similar windows, backtest metrics,
+and stored market summaries. The hosted spec uses OpenAPI `3.0.3`, includes the
+Cloud Run server URL, and declares the replay validation JSON request body.
 
 Configured Google Cloud resources:
 
@@ -271,7 +303,9 @@ The project is accepted only when these gates are backed by artifacts:
 - Agent Builder is configured with the hosted OpenAPI tool and playbook.
 - Gemini is actually used for summaries.
 - Replay mode can reproduce a fixed high-volatility window.
-- At least one replay alert has `alert_time < shift_onset_time`.
+- Strict replay acceptance covers 1s, 5s, and 30s horizons with early alerts and
+  median lead time at or above 5s.
+- Hot-path alert generation p95 latency is below 500ms.
 - Validation report includes lead time, false alerts, precision, recall, horizon PR-AUC, and ablation.
 
 See `docs/acceptance.md` for the current gate status and known external blockers.

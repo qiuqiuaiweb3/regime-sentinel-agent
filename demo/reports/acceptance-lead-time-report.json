@@ -1,0 +1,107 @@
+{
+  "alerts": [
+    {
+      "timestamp_ms": 0,
+      "state": "EarlyRisk",
+      "confidence": "Normal",
+      "horizon_ms": 1000,
+      "score": 2.25
+    },
+    {
+      "timestamp_ms": 0,
+      "state": "EarlyRisk",
+      "confidence": "Normal",
+      "horizon_ms": 5000,
+      "score": 2.1
+    },
+    {
+      "timestamp_ms": 20000,
+      "state": "EarlyRisk",
+      "confidence": "Normal",
+      "horizon_ms": 30000,
+      "score": 1.9
+    }
+  ],
+  "labels": [
+    {
+      "baseline_time_ms": 0,
+      "onset_time_ms": 1000,
+      "horizon_ms": 1000,
+      "direction": "Up",
+      "magnitude": 0.12
+    },
+    {
+      "baseline_time_ms": 0,
+      "onset_time_ms": 5000,
+      "horizon_ms": 5000,
+      "direction": "Up",
+      "magnitude": 0.15000000000000002
+    },
+    {
+      "baseline_time_ms": 0,
+      "onset_time_ms": 30000,
+      "horizon_ms": 30000,
+      "direction": "Up",
+      "magnitude": 0.19999999999999996
+    }
+  ],
+  "report": {
+    "results": [
+      {
+        "alert_time_ms": 0,
+        "shift_onset_time_ms": 1000,
+        "lead_time_ms": 1000,
+        "horizon_ms": 1000,
+        "timing": "Early"
+      },
+      {
+        "alert_time_ms": 0,
+        "shift_onset_time_ms": 5000,
+        "lead_time_ms": 5000,
+        "horizon_ms": 5000,
+        "timing": "Early"
+      },
+      {
+        "alert_time_ms": 20000,
+        "shift_onset_time_ms": 30000,
+        "lead_time_ms": 10000,
+        "horizon_ms": 30000,
+        "timing": "Early"
+      }
+    ],
+    "summary": {
+      "total_alerts": 3,
+      "early": 3,
+      "synchronous": 0,
+      "late": 0,
+      "false_alerts": 0
+    },
+    "metrics": {
+      "median_lead_time_ms": 5000.0,
+      "p75_lead_time_ms": 10000.0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "false_alerts_per_market": [
+        {
+          "market_slug": "replay",
+          "false_alerts": 0
+        }
+      ],
+      "horizon_pr_auc": [
+        {
+          "horizon_ms": 1000,
+          "pr_auc": 1.0
+        },
+        {
+          "horizon_ms": 5000,
+          "pr_auc": 1.0
+        },
+        {
+          "horizon_ms": 30000,
+          "pr_auc": 1.0
+        }
+      ]
+    }
+  },
+  "ablation": []
+}

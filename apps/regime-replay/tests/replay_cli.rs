@@ -1,6 +1,6 @@
 use assert_cmd::Command;
 use predicates::str::contains;
-use std::fs;
+use std::{fs, path::PathBuf};
 
 #[test]
 fn replay_cli_outputs_validation_json() {
@@ -161,4 +161,24 @@ fn replay_cli_generates_alerts_from_feature_windows_when_alerts_are_absent() {
         .stdout(contains(r#""early":1"#))
         .stdout(contains(r#""lead_time_ms":250"#))
         .stdout(contains(r#""ablation":[{"variant":"baseline""#));
+}
+
+#[test]
+fn replay_cli_acceptance_fixture_reports_1s_5s_30s_lead_time_evidence() {
+    let input_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../demo/replay/acceptance-lead-time-window.json");
+
+    Command::cargo_bin("regime-replay")
+        .expect("regime-replay binary")
+        .arg("--input")
+        .arg(input_path)
+        .assert()
+        .success()
+        .stdout(contains(r#""total_alerts":3"#))
+        .stdout(contains(r#""median_lead_time_ms":5000.0"#))
+        .stdout(contains(r#""p75_lead_time_ms":10000.0"#))
+        .stdout(contains(r#""recall":1.0"#))
+        .stdout(contains(r#""horizon_ms":1000"#))
+        .stdout(contains(r#""horizon_ms":5000"#))
+        .stdout(contains(r#""horizon_ms":30000"#));
 }

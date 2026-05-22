@@ -1,0 +1,40 @@
+{
+  "price_points": [
+    { "timestamp_ms": 0, "p_mid": 0.5 },
+    { "timestamp_ms": 1000, "p_mid": 0.62 },
+    { "timestamp_ms": 4000, "p_mid": 0.62 },
+    { "timestamp_ms": 5000, "p_mid": 0.65 },
+    { "timestamp_ms": 8000, "p_mid": 0.65 },
+    { "timestamp_ms": 30000, "p_mid": 0.7 },
+    { "timestamp_ms": 33000, "p_mid": 0.7 }
+  ],
+  "alerts": [
+    {
+      "timestamp_ms": 0,
+      "state": "EarlyRisk",
+      "confidence": "Normal",
+      "horizon_ms": 1000,
+      "score": 2.25
+    },
+    {
+      "timestamp_ms": 0,
+      "state": "EarlyRisk",
+      "confidence": "Normal",
+      "horizon_ms": 5000,
+      "score": 2.1
+    },
+    {
+      "timestamp_ms": 20000,
+      "state": "EarlyRisk",
+      "confidence": "Normal",
+      "horizon_ms": 30000,
+      "score": 1.9
+    }
+  ],
+  "label_config": {
+    "horizons_ms": [1000, 5000, 30000],
+    "min_move": 0.1,
+    "persist_ms": 3000
+  },
+  "synchronous_tolerance_ms": 100
+}

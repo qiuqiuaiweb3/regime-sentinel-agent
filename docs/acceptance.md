@@ -12,10 +12,18 @@ hosted Google Cloud infrastructure.
 - Axum REST/SSE API:
   - `GET /health`
   - `GET /api/dashboard/snapshot`
+  - `GET /api/dashboard/snapshot?mode=live|replay`
   - `GET /api/dashboard/events`
   - `POST /api/replay/validate`
+  - `GET /api/agent/current-regime`
+  - `GET /api/agent/recent-alerts`
+  - `POST /api/agent/similar-windows`
+  - `GET /api/agent/backtest-metrics`
+  - `GET /api/agent/market-summary`
   - `GET /api/openapi.json`
-- SvelteKit dashboard served by Axum static fallback.
+- SvelteKit dashboard served by Axum static fallback, with live/replay mode,
+  TradingView Lightweight Charts, similar-history context, validation metrics,
+  and Gemini summary coverage.
 - Polymarket CLOB market collector core, Coinbase BTC reference collector core,
   stale-data downgrade, and NDJSON fallback.
 - Gemini summary request builder/parser/scheduler, disabled by default and gated by
@@ -35,6 +43,23 @@ hosted Google Cloud infrastructure.
   - `demo/reports/backtest-run.sample.json`
 - Current replay sample has one early alert at `750ms` for a shift onset at `1000ms`,
   with `250ms` lead time.
+- Strict deterministic replay acceptance artifacts:
+  - `demo/replay/acceptance-lead-time-window.json`
+  - `demo/reports/acceptance-lead-time-report.json`
+  - `demo/reports/acceptance-lead-time-report.csv`
+  - The fixture covers `1s`, `5s`, and `30s` horizons with early alerts at
+    `1000ms`, `5000ms`, and `10000ms` lead time.
+  - The report records `median_lead_time_ms=5000.0`,
+    `p75_lead_time_ms=10000.0`, `precision=1.0`, `recall=1.0`, and PR-AUC
+    `1.0` for all three horizons.
+  - This is deterministic replay proof for the demo acceptance gate, not a claim
+    of statistically validated live forecasting skill.
+- Hot-path latency probe:
+  - binary: `cargo run -q -p regime-replay --bin latency-probe`
+  - input: `demo/replay/latency-probe-window.json`
+  - report: `demo/reports/latency-probe-report.json`
+  - Latest local run used `256` samples and recorded p95 hot-path alert
+    generation latency at `240ns` / `1us`, below the `500ms` gate.
 - MongoDB Atlas demo seed and verify CLIs are available:
   - `cargo run -p regime-service --bin seed_demo_mongodb`
   - `cargo run -p regime-service --bin verify_demo_mongodb`
@@ -95,8 +120,16 @@ npm test -- --run
 npm run check
 npm run build
 npm audit --omit=dev
-cargo run -q -p regime-replay -- --input demo/replay/high-volatility-btc-window.json | jq .
-cargo run -q -p regime-replay -- --input demo/replay/high-volatility-btc-window.json --format csv
+cargo run -q -p regime-replay --bin regime-replay -- \
+  --input demo/replay/high-volatility-btc-window.json | jq .
+cargo run -q -p regime-replay --bin regime-replay -- \
+  --input demo/replay/high-volatility-btc-window.json --format csv
+cargo run -q -p regime-replay --bin regime-replay -- \
+  --input demo/replay/acceptance-lead-time-window.json | jq .
+cargo run -q -p regime-replay --bin regime-replay -- \
+  --input demo/replay/acceptance-lead-time-window.json --format csv
+cargo run -q -p regime-replay --bin latency-probe -- \
+  --input demo/replay/latency-probe-window.json --samples 256
 cargo run -p regime-service --bin seed_demo_mongodb
 cargo run -p regime-service --bin verify_demo_mongodb
 GEMINI_ENABLED=true GEMINI_PROVIDER=vertex GEMINI_LOCATION=global \

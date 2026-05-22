@@ -1,0 +1,15 @@
+{
+  "operation": "generate_alerts_from_feature_windows",
+  "samples": 256,
+  "p50_processing_ns": 210,
+  "p95_processing_ns": 240,
+  "p99_processing_ns": 251,
+  "max_processing_ns": 3868,
+  "p50_processing_us": 1,
+  "p95_processing_us": 1,
+  "p99_processing_us": 1,
+  "max_processing_us": 4,
+  "max_p95_ms": 500,
+  "p95_under_500ms": true,
+  "passed": true
+}

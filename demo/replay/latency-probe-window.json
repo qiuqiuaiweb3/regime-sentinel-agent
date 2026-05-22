@@ -1,0 +1,69 @@
+{
+  "feature_windows": [
+    {
+      "slug": "btc-updown-latency",
+      "window_ts_ms": -1000,
+      "window_ms": 1000,
+      "p_mid": 0.5,
+      "p_fair": 0.5,
+      "fair_gap": 0.0,
+      "ofi_1s": 0.01,
+      "depth_imbalance": 0.01,
+      "spread": 0.02,
+      "volume_acceleration": 0.01,
+      "feature_vector": [0.0, 0.01, 0.01, 0.02, 0.01]
+    },
+    {
+      "slug": "btc-updown-latency",
+      "window_ts_ms": 0,
+      "window_ms": 1000,
+      "p_mid": 0.5,
+      "p_fair": 0.45,
+      "fair_gap": 0.05,
+      "ofi_1s": 0.6,
+      "depth_imbalance": 0.45,
+      "spread": 0.02,
+      "volume_acceleration": 2.0,
+      "feature_vector": [0.05, 0.6, 0.45, 0.02, 2.0]
+    },
+    {
+      "slug": "btc-updown-latency",
+      "window_ts_ms": 5000,
+      "window_ms": 1000,
+      "p_mid": 0.65,
+      "p_fair": 0.5,
+      "fair_gap": 0.15,
+      "ofi_1s": 0.5,
+      "depth_imbalance": 0.4,
+      "spread": 0.03,
+      "volume_acceleration": 1.7,
+      "feature_vector": [0.15, 0.5, 0.4, 0.03, 1.7]
+    },
+    {
+      "slug": "btc-updown-latency",
+      "window_ts_ms": 20000,
+      "window_ms": 1000,
+      "p_mid": 0.68,
+      "p_fair": 0.49,
+      "fair_gap": 0.19,
+      "ofi_1s": 0.55,
+      "depth_imbalance": 0.42,
+      "spread": 0.03,
+      "volume_acceleration": 1.8,
+      "feature_vector": [0.19, 0.55, 0.42, 0.03, 1.8]
+    }
+  ],
+  "score_weights": {
+    "fair_gap_velocity": 4.0,
+    "depth_imbalance": 1.0,
+    "ofi_1s": 1.0,
+    "volume_acceleration": 0.5,
+    "stale_data_penalty": 1.0
+  },
+  "score_thresholds": {
+    "watch": 0.5,
+    "early_risk": 1.0,
+    "shift_detected_move": 0.1
+  },
+  "alert_horizon_ms": 1000
+}
