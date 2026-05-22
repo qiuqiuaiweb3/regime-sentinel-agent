@@ -1366,8 +1366,9 @@ pub mod live_collector {
     use regime_core::{MarketTickMeta, MarketTickRecord, RegimeStateRecord};
     use serde::Serialize;
     use serde_json::{Value, json};
+    use std::collections::BTreeSet;
     use std::fs::OpenOptions;
-    use std::io::Write;
+    use std::io::{BufRead, BufReader, Write};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -1397,6 +1398,20 @@ pub mod live_collector {
         pub series: String,
         pub source: String,
         asset_outcomes: Vec<(String, String)>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct LiveSmokeReport {
+        pub slug: String,
+        pub duration_seconds: u64,
+        pub ndjson_path: String,
+        pub market_ticks: usize,
+        pub reference_ticks: usize,
+        pub stale_states: usize,
+        pub outcomes: Vec<String>,
+        pub first_tick_timestamp_ms: Option<i64>,
+        pub last_tick_timestamp_ms: Option<i64>,
+        pub passed: bool,
     }
 
     impl LiveCollectorConfig {
@@ -1522,6 +1537,9 @@ pub mod live_collector {
         meta: &LiveMarketMeta,
         received_at_ms: i64,
     ) -> Result<Vec<MarketTickRecord>, String> {
+        if matches!(payload.trim(), "PING" | "PONG") {
+            return Ok(Vec::new());
+        }
         let value: Value = serde_json::from_str(payload)
             .map_err(|error| format!("invalid websocket JSON: {error}"))?;
         market_ticks_from_value(&value, meta, received_at_ms)
@@ -1808,6 +1826,76 @@ pub mod live_collector {
         .context("serialize NDJSON fallback")?;
         writeln!(file).context("write NDJSON newline")?;
         Ok(())
+    }
+
+    pub fn summarize_live_smoke_ndjson(
+        slug: &str,
+        duration_seconds: u64,
+        path: impl AsRef<Path>,
+    ) -> anyhow::Result<LiveSmokeReport> {
+        let path = path.as_ref();
+        let file = std::fs::File::open(path).context("open live smoke NDJSON")?;
+        let reader = BufReader::new(file);
+        let mut market_ticks = 0;
+        let mut reference_ticks = 0;
+        let mut stale_states = 0;
+        let mut outcomes = BTreeSet::new();
+        let mut first_tick_timestamp_ms = None::<i64>;
+        let mut last_tick_timestamp_ms = None::<i64>;
+
+        for line in reader.lines() {
+            let line = line.context("read live smoke NDJSON line")?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value =
+                serde_json::from_str(&line).context("parse live smoke NDJSON line")?;
+            let kind = value.get("kind").and_then(Value::as_str);
+            if kind == Some("regime_state") {
+                stale_states += 1;
+                continue;
+            }
+            if kind != Some("market_tick") {
+                continue;
+            }
+
+            let record = &value["record"];
+            if record["meta"]["slug"].as_str() != Some(slug) {
+                continue;
+            }
+
+            match record["meta"]["source"].as_str() {
+                Some("clob") => market_ticks += 1,
+                Some("coinbase") => reference_ticks += 1,
+                _ => {}
+            }
+            if let Some(outcome) = record["outcome"].as_str() {
+                outcomes.insert(outcome.to_string());
+            }
+            if let Some(timestamp_ms) = record["timestamp_ms"].as_i64() {
+                first_tick_timestamp_ms = Some(
+                    first_tick_timestamp_ms
+                        .map_or(timestamp_ms, |current| current.min(timestamp_ms)),
+                );
+                last_tick_timestamp_ms = Some(
+                    last_tick_timestamp_ms
+                        .map_or(timestamp_ms, |current| current.max(timestamp_ms)),
+                );
+            }
+        }
+
+        Ok(LiveSmokeReport {
+            slug: slug.to_string(),
+            duration_seconds,
+            ndjson_path: path.display().to_string(),
+            market_ticks,
+            reference_ticks,
+            stale_states,
+            outcomes: outcomes.into_iter().collect(),
+            first_tick_timestamp_ms,
+            last_tick_timestamp_ms,
+            passed: market_ticks > 0 && reference_ticks > 0,
+        })
     }
 
     async fn handle_market_message(

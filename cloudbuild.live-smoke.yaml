@@ -1,0 +1,80 @@
+steps:
+  - name: rust:1.95-bookworm
+    entrypoint: bash
+    args:
+      - -lc
+      - |
+        set -euo pipefail
+
+        apt-get update
+        apt-get install -y --no-install-recommends ca-certificates cmake curl jq pkg-config
+        rm -rf /var/lib/apt/lists/*
+
+        mkdir -p /workspace/live-smoke
+        now_s=$$(date +%s)
+        floor_s=$$(( now_s - now_s % 300 ))
+        : > /workspace/live-smoke/markets.tmp
+
+        for offset in 0 300 600; do
+          slug="btc-updown-5m-$$(( floor_s + offset ))"
+          curl -fsS "https://gamma-api.polymarket.com/events/slug/$${slug}" \
+            | jq --arg slug "$${slug}" '
+              def arr(x):
+                if x == null then []
+                elif (x | type) == "array" then x
+                elif (x | type) == "string" then (x | fromjson? // [])
+                else []
+                end;
+              .markets[0]
+              | {
+                    slug: $slug,
+                    title,
+                    clobTokenIds: arr(.clobTokenIds),
+                    outcomes: arr(.outcomes),
+                    active,
+                    closed
+                  }
+              | select(.active == true and .closed == false and (.clobTokenIds | length >= 2))
+            ' >> /workspace/live-smoke/markets.tmp
+        done
+
+        jq -s . /workspace/live-smoke/markets.tmp > /workspace/live-smoke/markets.json
+
+        market_count=$$(jq 'length' /workspace/live-smoke/markets.json)
+        if [ "$${market_count}" -lt 3 ]; then
+          echo "Expected at least 3 active BTC 5m markets, found $${market_count}" >&2
+          cat /workspace/live-smoke/markets.json >&2
+          exit 1
+        fi
+
+        for i in 0 1 2; do
+          slug=$$(jq -r ".[$${i}].slug" /workspace/live-smoke/markets.json)
+          asset_ids=$$(jq -r ".[$${i}].clobTokenIds | join(\",\")" /workspace/live-smoke/markets.json)
+          outcomes=$$(jq -r ".[$${i}].outcomes | map(ascii_upcase) | join(\",\")" /workspace/live-smoke/markets.json)
+          echo "Running live smoke for $${slug}" >&2
+          LIVE_COLLECTOR_ENABLED=true \
+          LIVE_MARKET_SLUG="$${slug}" \
+          LIVE_MARKET_SERIES=btc-updown-5m \
+          POLYMARKET_ASSET_IDS="$${asset_ids}" \
+          POLYMARKET_OUTCOMES="$${outcomes}" \
+          LIVE_COLLECTOR_NDJSON_PATH="/workspace/live-smoke/$${slug}.ndjson" \
+          LIVE_SMOKE_DURATION_SECONDS="${_LIVE_SMOKE_DURATION_SECONDS}" \
+            /usr/local/cargo/bin/cargo run -q -p regime-service --bin live_smoke \
+            | tee "/workspace/live-smoke/$${slug}.json"
+        done
+
+        jq -s '{passed: all(.[]; .passed), windows: .}' /workspace/live-smoke/btc-updown-5m-*.json \
+          > /workspace/live-smoke/summary.json
+        cat /workspace/live-smoke/summary.json
+        test "$$(jq -r '.passed' /workspace/live-smoke/summary.json)" = true
+
+timeout: 1800s
+
+substitutions:
+  _LIVE_SMOKE_DURATION_SECONDS: '30'
+
+artifacts:
+  objects:
+    location: gs://poly-market-analysis_cloudbuild/live-smoke/$BUILD_ID
+    paths:
+      - /workspace/live-smoke/*

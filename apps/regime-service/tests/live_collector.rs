@@ -1,7 +1,7 @@
 use regime_service::live_collector::{
     LiveCollectorConfig, append_ndjson_fallback, market_ticks_from_message,
     persist_market_tick_or_fallback, reference_tick_from_coinbase_message, stale_data_penalty,
-    stale_regime_state,
+    stale_regime_state, summarize_live_smoke_ndjson,
 };
 use serde_json::Value;
 
@@ -114,6 +114,26 @@ fn market_ticks_from_price_change_preserves_asset_outcome_and_receive_lag() {
     assert_eq!(ticks[0].side, "BUY");
     assert_eq!(ticks[0].outcome, "UP");
     assert_eq!(ticks[0].receive_lag_ms, 150);
+}
+
+#[test]
+fn market_ticks_ignore_plain_websocket_heartbeats() {
+    let config = LiveCollectorConfig::from_env_values(
+        Some("true"),
+        Some("btc-updown-5m-1769000000"),
+        Some("btc-updown-5m"),
+        Some("yes-token,no-token"),
+        Some("UP,DOWN"),
+        None,
+        Some("/tmp/regime-fallback.ndjson"),
+        Some("1500"),
+    )
+    .expect("collector config");
+
+    let ticks = market_ticks_from_message("PONG", &config.market_meta(), 1_769_000_000_900)
+        .expect("heartbeat ignored");
+
+    assert!(ticks.is_empty());
 }
 
 #[test]
@@ -237,4 +257,29 @@ async fn market_tick_persistence_without_mongodb_writes_ndjson_fallback() {
     let line: Value = serde_json::from_str(content.trim()).expect("fallback json");
     assert_eq!(line["kind"], "market_tick");
     assert_eq!(line["record"]["outcome"], "UP");
+}
+
+#[test]
+fn live_smoke_summary_counts_market_and_reference_ticks() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("live-smoke.ndjson");
+    std::fs::write(
+        &path,
+        r#"{"kind":"market_tick","record":{"timestamp_ms":1769000000100,"meta":{"slug":"btc-updown-5m-1769000000","series":"btc-updown-5m","source":"clob"},"price":0.54,"size":10.0,"side":"BUY","outcome":"UP","receive_lag_ms":25}}
+{"kind":"market_tick","record":{"timestamp_ms":1769000000200,"meta":{"slug":"btc-updown-5m-1769000000","series":"btc-updown-5m","source":"coinbase"},"price":65000.25,"size":0.0,"side":"TICKER","outcome":"BTC-USD","receive_lag_ms":15}}
+{"kind":"regime_state","record":{"id":"btc-updown-5m-1769000000","regime":"STALE_DATA"}}
+"#,
+    )
+    .expect("write smoke fixture");
+
+    let report =
+        summarize_live_smoke_ndjson("btc-updown-5m-1769000000", 30, &path).expect("summary");
+
+    assert!(report.passed);
+    assert_eq!(report.market_ticks, 1);
+    assert_eq!(report.reference_ticks, 1);
+    assert_eq!(report.stale_states, 1);
+    assert_eq!(report.first_tick_timestamp_ms, Some(1_769_000_000_100));
+    assert_eq!(report.last_tick_timestamp_ms, Some(1_769_000_000_200));
+    assert_eq!(report.outcomes, vec!["BTC-USD", "UP"]);
 }

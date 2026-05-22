@@ -1946,6 +1946,7 @@ dependencies = [
  "mongodb",
  "regime-core",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",

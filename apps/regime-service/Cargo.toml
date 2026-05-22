@@ -14,6 +14,7 @@ futures-util.workspace = true
 mongodb.workspace = true
 regime-core = { path = "../../crates/regime-core" }
 reqwest.workspace = true
+rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
