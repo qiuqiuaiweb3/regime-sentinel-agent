@@ -167,6 +167,66 @@ pub mod similar_windows {
     }
 }
 
+pub mod mongo_bootstrap {
+    use std::collections::HashSet;
+
+    use crate::mongo_indexes::{
+        collection_create_models, regular_index_models, vector_search_index_models,
+    };
+
+    #[derive(Debug, Clone, Eq, PartialEq)]
+    pub struct BootstrapIndexTarget {
+        pub collection_name: &'static str,
+        pub index_name: String,
+    }
+
+    #[derive(Debug, Clone, Eq, PartialEq)]
+    pub struct MongoBootstrapPlan {
+        pub collections_to_create: Vec<&'static str>,
+        pub regular_indexes_to_create: Vec<BootstrapIndexTarget>,
+        pub vector_search_indexes_to_create: Vec<BootstrapIndexTarget>,
+    }
+
+    pub fn mongo_bootstrap_plan(
+        existing_collection_names: impl IntoIterator<Item = String>,
+    ) -> MongoBootstrapPlan {
+        let existing_collection_names = existing_collection_names
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let collections_to_create = collection_create_models()
+            .into_iter()
+            .filter(|model| !existing_collection_names.contains(model.collection_name))
+            .map(|model| model.collection_name)
+            .collect();
+
+        let regular_indexes_to_create = regular_index_models()
+            .into_iter()
+            .map(|model| BootstrapIndexTarget {
+                collection_name: model.collection_name,
+                index_name: model
+                    .index
+                    .options
+                    .and_then(|options| options.name)
+                    .expect("regular index model name"),
+            })
+            .collect();
+
+        let vector_search_indexes_to_create = vector_search_index_models()
+            .into_iter()
+            .map(|model| BootstrapIndexTarget {
+                collection_name: model.collection_name,
+                index_name: model.index.name.expect("vector search index model name"),
+            })
+            .collect();
+
+        MongoBootstrapPlan {
+            collections_to_create,
+            regular_indexes_to_create,
+            vector_search_indexes_to_create,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     status: &'static str,
