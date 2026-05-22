@@ -8,6 +8,54 @@ use regime_core::{
 };
 use serde::{Deserialize, Serialize};
 
+pub mod mongo_indexes {
+    use std::time::Duration;
+
+    use mongodb::{IndexModel, bson::Document, options::IndexOptions};
+    use regime_core::{CollectionKind, mongo_index_specs};
+
+    #[derive(Debug, Clone)]
+    pub struct CollectionIndexModel {
+        pub collection_name: &'static str,
+        pub index: IndexModel,
+    }
+
+    pub fn regular_index_models() -> Vec<CollectionIndexModel> {
+        mongo_index_specs()
+            .into_iter()
+            .map(|spec| {
+                let mut keys = Document::new();
+                for field in spec.fields {
+                    keys.insert(*field, 1);
+                }
+
+                let mut options = IndexOptions::default();
+                options.name = Some(spec.name.to_string());
+                options.unique = spec.unique.then_some(true);
+                options.expire_after = spec
+                    .ttl_seconds
+                    .map(|seconds| Duration::from_secs(seconds as u64));
+
+                CollectionIndexModel {
+                    collection_name: collection_name(spec.collection),
+                    index: IndexModel::builder().keys(keys).options(options).build(),
+                }
+            })
+            .collect()
+    }
+
+    fn collection_name(kind: CollectionKind) -> &'static str {
+        match kind {
+            CollectionKind::MarketTicks => "market_ticks",
+            CollectionKind::FeatureWindows => "feature_windows",
+            CollectionKind::RegimeStates => "regime_states",
+            CollectionKind::Alerts => "alerts",
+            CollectionKind::AgentSummaries => "agent_summaries",
+            CollectionKind::BacktestRuns => "backtest_runs",
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     status: &'static str,

@@ -1,20 +1,27 @@
 use regime_core::{
-    CollectionKind, VectorSearchSpec, mongo_collection_names, mongo_index_specs,
+    CollectionKind, TimeSeriesSpec, VectorSearchSpec, mongo_collection_specs, mongo_index_specs,
     vector_search_specs,
 };
 
 #[test]
-fn mongo_collection_names_match_plan() {
-    assert_eq!(
-        mongo_collection_names(),
-        [
-            "market_ticks",
-            "feature_windows",
-            "regime_states",
-            "alerts",
-            "agent_summaries",
-            "backtest_runs"
-        ]
+fn mongo_collection_specs_match_plan() {
+    let specs = mongo_collection_specs();
+
+    assert_eq!(specs.len(), 6);
+    assert!(specs.iter().any(|spec| {
+        spec.name == "market_ticks"
+            && spec.kind == CollectionKind::MarketTicks
+            && spec.time_series
+                == Some(TimeSeriesSpec {
+                    time_field: "timestamp",
+                    meta_field: "meta",
+                    expire_after_seconds: 604_800,
+                })
+    }));
+    assert!(
+        specs
+            .iter()
+            .any(|spec| spec.name == "feature_windows" && spec.time_series.is_none())
     );
 }
 
@@ -26,7 +33,7 @@ fn mongo_index_specs_cover_hot_path_and_validation_collections() {
         spec.collection == CollectionKind::MarketTicks
             && spec.name == "market_ticks_slug_timestamp"
             && spec.fields == ["meta.slug", "timestamp"]
-            && spec.ttl_seconds == Some(604_800)
+            && spec.ttl_seconds.is_none()
     }));
     assert!(specs.iter().any(|spec| {
         spec.collection == CollectionKind::FeatureWindows

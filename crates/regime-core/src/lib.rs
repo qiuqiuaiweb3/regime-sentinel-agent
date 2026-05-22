@@ -131,6 +131,20 @@ pub enum CollectionKind {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+pub struct TimeSeriesSpec {
+    pub time_field: &'static str,
+    pub meta_field: &'static str,
+    pub expire_after_seconds: i64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+pub struct MongoCollectionSpec {
+    pub kind: CollectionKind,
+    pub name: &'static str,
+    pub time_series: Option<TimeSeriesSpec>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 pub struct MongoIndexSpec {
     pub collection: CollectionKind,
     pub name: &'static str,
@@ -284,13 +298,45 @@ pub fn validate_alerts(
 }
 
 pub fn mongo_collection_names() -> [&'static str; 6] {
+    mongo_collection_specs().map(|spec| spec.name)
+}
+
+pub fn mongo_collection_specs() -> [MongoCollectionSpec; 6] {
     [
-        "market_ticks",
-        "feature_windows",
-        "regime_states",
-        "alerts",
-        "agent_summaries",
-        "backtest_runs",
+        MongoCollectionSpec {
+            kind: CollectionKind::MarketTicks,
+            name: "market_ticks",
+            time_series: Some(TimeSeriesSpec {
+                time_field: "timestamp",
+                meta_field: "meta",
+                expire_after_seconds: 7 * 24 * 60 * 60,
+            }),
+        },
+        MongoCollectionSpec {
+            kind: CollectionKind::FeatureWindows,
+            name: "feature_windows",
+            time_series: None,
+        },
+        MongoCollectionSpec {
+            kind: CollectionKind::RegimeStates,
+            name: "regime_states",
+            time_series: None,
+        },
+        MongoCollectionSpec {
+            kind: CollectionKind::Alerts,
+            name: "alerts",
+            time_series: None,
+        },
+        MongoCollectionSpec {
+            kind: CollectionKind::AgentSummaries,
+            name: "agent_summaries",
+            time_series: None,
+        },
+        MongoCollectionSpec {
+            kind: CollectionKind::BacktestRuns,
+            name: "backtest_runs",
+            time_series: None,
+        },
     ]
 }
 
@@ -301,7 +347,7 @@ pub fn mongo_index_specs() -> [MongoIndexSpec; 6] {
             name: "market_ticks_slug_timestamp",
             fields: &["meta.slug", "timestamp"],
             unique: false,
-            ttl_seconds: Some(7 * 24 * 60 * 60),
+            ttl_seconds: None,
         },
         MongoIndexSpec {
             collection: CollectionKind::FeatureWindows,
