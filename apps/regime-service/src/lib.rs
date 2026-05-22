@@ -649,6 +649,7 @@ pub mod gemini_throttle {
 
 pub mod live_collector {
     use anyhow::Context;
+    use chrono::DateTime;
     use futures_util::{SinkExt, StreamExt};
     use regime_core::{MarketTickMeta, MarketTickRecord, RegimeStateRecord};
     use serde::Serialize;
@@ -660,6 +661,8 @@ pub mod live_collector {
     use tokio_tungstenite::{connect_async, tungstenite::Message};
 
     pub const DEFAULT_MARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+    pub const DEFAULT_REFERENCE_WS_URL: &str = "wss://ws-feed.exchange.coinbase.com";
+    pub const DEFAULT_REFERENCE_PRODUCT_ID: &str = "BTC-USD";
     pub const DEFAULT_STALE_AFTER_MS: i64 = 1_500;
 
     #[derive(Debug, Clone, PartialEq)]
@@ -670,6 +673,8 @@ pub mod live_collector {
         pub asset_ids: Vec<String>,
         pub outcomes: Vec<String>,
         pub market_ws_url: String,
+        pub reference_ws_url: String,
+        pub reference_product_id: String,
         pub ndjson_path: PathBuf,
         pub stale_after_ms: i64,
     }
@@ -710,6 +715,8 @@ pub mod live_collector {
                     asset_ids: Vec::new(),
                     outcomes: Vec::new(),
                     market_ws_url: market_ws_url.unwrap_or(DEFAULT_MARKET_WS_URL).to_string(),
+                    reference_ws_url: DEFAULT_REFERENCE_WS_URL.to_string(),
+                    reference_product_id: DEFAULT_REFERENCE_PRODUCT_ID.to_string(),
                     ndjson_path: PathBuf::from(ndjson_path.unwrap_or("data/live-fallback.ndjson")),
                     stale_after_ms,
                 });
@@ -740,13 +747,15 @@ pub mod live_collector {
                 asset_ids,
                 outcomes,
                 market_ws_url: market_ws_url.unwrap_or(DEFAULT_MARKET_WS_URL).to_string(),
+                reference_ws_url: DEFAULT_REFERENCE_WS_URL.to_string(),
+                reference_product_id: DEFAULT_REFERENCE_PRODUCT_ID.to_string(),
                 ndjson_path: PathBuf::from(ndjson_path.unwrap_or("data/live-fallback.ndjson")),
                 stale_after_ms,
             })
         }
 
         pub fn from_env() -> Result<Self, String> {
-            Self::from_env_values(
+            let mut config = Self::from_env_values(
                 std::env::var("LIVE_COLLECTOR_ENABLED").ok().as_deref(),
                 std::env::var("LIVE_MARKET_SLUG").ok().as_deref(),
                 std::env::var("LIVE_MARKET_SERIES").ok().as_deref(),
@@ -757,7 +766,12 @@ pub mod live_collector {
                 std::env::var("LIVE_COLLECTOR_STALE_AFTER_MS")
                     .ok()
                     .as_deref(),
-            )
+            )?;
+            config.reference_ws_url = std::env::var("REFERENCE_PRICE_WS_URL")
+                .unwrap_or_else(|_| DEFAULT_REFERENCE_WS_URL.to_string());
+            config.reference_product_id = std::env::var("REFERENCE_PRICE_PRODUCT_ID")
+                .unwrap_or_else(|_| DEFAULT_REFERENCE_PRODUCT_ID.to_string());
+            Ok(config)
         }
 
         pub fn subscription_message(&self) -> Value {
@@ -781,6 +795,14 @@ pub mod live_collector {
                     .collect(),
             }
         }
+
+        pub fn reference_subscription_message(&self) -> Value {
+            json!({
+                "type": "subscribe",
+                "product_ids": [self.reference_product_id],
+                "channels": ["ticker", "heartbeat"]
+            })
+        }
     }
 
     pub fn market_ticks_from_message(
@@ -791,6 +813,41 @@ pub mod live_collector {
         let value: Value = serde_json::from_str(payload)
             .map_err(|error| format!("invalid websocket JSON: {error}"))?;
         market_ticks_from_value(&value, meta, received_at_ms)
+    }
+
+    pub fn reference_tick_from_coinbase_message(
+        payload: &str,
+        config: &LiveCollectorConfig,
+        received_at_ms: i64,
+    ) -> Result<Option<MarketTickRecord>, String> {
+        let value: Value = serde_json::from_str(payload)
+            .map_err(|error| format!("invalid reference JSON: {error}"))?;
+        if value.get("type").and_then(Value::as_str) != Some("ticker") {
+            return Ok(None);
+        }
+        let product_id = string_field(&value, "product_id")?;
+        if product_id != config.reference_product_id {
+            return Ok(None);
+        }
+        let timestamp_ms = value
+            .get("time")
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339_ms)
+            .unwrap_or(received_at_ms);
+
+        Ok(Some(MarketTickRecord {
+            timestamp_ms,
+            meta: MarketTickMeta {
+                slug: config.slug.clone(),
+                series: config.series.clone(),
+                source: "coinbase".to_string(),
+            },
+            price: f64_field(&value, "price")?,
+            size: 0.0,
+            side: "TICKER".to_string(),
+            outcome: product_id.to_string(),
+            receive_lag_ms: (received_at_ms - timestamp_ms).max(0),
+        }))
     }
 
     pub fn stale_data_penalty(
@@ -945,6 +1002,76 @@ pub mod live_collector {
         }
     }
 
+    pub async fn run_reference_price_collector(
+        config: LiveCollectorConfig,
+        store: Option<crate::mongo_store::MongoStore>,
+    ) -> anyhow::Result<()> {
+        if !config.enabled {
+            return Ok(());
+        }
+
+        loop {
+            let ws_stream = match connect_async(&config.reference_ws_url).await {
+                Ok((ws_stream, _)) => ws_stream,
+                Err(error) => {
+                    tracing::warn!(?error, "connect reference price websocket failed");
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    continue;
+                }
+            };
+
+            let (mut write, mut read) = ws_stream.split();
+            write
+                .send(Message::Text(
+                    config.reference_subscription_message().to_string().into(),
+                ))
+                .await
+                .context("send reference price subscription")?;
+
+            while let Some(message) = read.next().await {
+                match message {
+                    Ok(Message::Text(text)) => {
+                        handle_reference_message(
+                            text.as_ref(),
+                            &config,
+                            store.as_ref(),
+                            &config.ndjson_path,
+                        )
+                        .await;
+                    }
+                    Ok(Message::Binary(bytes)) => {
+                        if let Ok(text) = std::str::from_utf8(&bytes) {
+                            handle_reference_message(
+                                text,
+                                &config,
+                                store.as_ref(),
+                                &config.ndjson_path,
+                            )
+                            .await;
+                        }
+                    }
+                    Ok(Message::Ping(payload)) => {
+                        write
+                            .send(Message::Pong(payload))
+                            .await
+                            .context("send reference websocket pong")?;
+                    }
+                    Ok(Message::Close(close)) => {
+                        tracing::warn!(?close, "reference price websocket closed");
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(?error, "reference price websocket read failed");
+                        break;
+                    }
+                }
+            }
+
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    }
+
     pub fn append_ndjson_fallback<T: Serialize>(
         path: impl AsRef<Path>,
         kind: &str,
@@ -991,6 +1118,27 @@ pub mod live_collector {
             }
             Err(error) => {
                 tracing::warn!(%error, "parse Polymarket market websocket message failed");
+            }
+        }
+    }
+
+    async fn handle_reference_message(
+        payload: &str,
+        config: &LiveCollectorConfig,
+        store: Option<&crate::mongo_store::MongoStore>,
+        fallback_path: &Path,
+    ) {
+        match reference_tick_from_coinbase_message(payload, config, unix_timestamp_ms()) {
+            Ok(Some(tick)) => {
+                if let Err(error) =
+                    persist_market_tick_or_fallback(store, &tick, fallback_path).await
+                {
+                    tracing::warn!(?error, "persist reference price tick failed");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, "parse reference price websocket message failed");
             }
         }
     }
@@ -1132,6 +1280,12 @@ pub mod live_collector {
                 Value::Number(raw) => raw.as_i64(),
                 _ => None,
             })
+    }
+
+    fn parse_rfc3339_ms(value: &str) -> Option<i64> {
+        DateTime::parse_from_rfc3339(value)
+            .map(|timestamp| timestamp.timestamp_millis())
+            .ok()
     }
 
     fn string_field<'a>(value: &'a Value, field: &str) -> Result<&'a str, String> {

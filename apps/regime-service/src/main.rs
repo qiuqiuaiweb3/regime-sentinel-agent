@@ -1,7 +1,7 @@
 use anyhow::Context;
 use mongodb::Client;
 use regime_service::{
-    live_collector::{LiveCollectorConfig, run_live_collector},
+    live_collector::{LiveCollectorConfig, run_live_collector, run_reference_price_collector},
     mongo_store::MongoStore,
 };
 use std::{env, net::SocketAddr};
@@ -29,9 +29,18 @@ async fn main() -> anyhow::Result<()> {
                 None
             }
         };
+        let market_config = collector_config.clone();
+        let market_store = collector_store.clone();
         tokio::spawn(async move {
-            if let Err(error) = run_live_collector(collector_config, collector_store).await {
+            if let Err(error) = run_live_collector(market_config, market_store).await {
                 tracing::error!(?error, "live collector stopped");
+            }
+        });
+        tokio::spawn(async move {
+            if let Err(error) =
+                run_reference_price_collector(collector_config, collector_store).await
+            {
+                tracing::error!(?error, "reference price collector stopped");
             }
         });
     }

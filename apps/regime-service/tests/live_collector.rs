@@ -1,6 +1,7 @@
 use regime_service::live_collector::{
     LiveCollectorConfig, append_ndjson_fallback, market_ticks_from_message,
-    persist_market_tick_or_fallback, stale_data_penalty, stale_regime_state,
+    persist_market_tick_or_fallback, reference_tick_from_coinbase_message, stale_data_penalty,
+    stale_regime_state,
 };
 use serde_json::Value;
 
@@ -49,6 +50,30 @@ fn live_collector_config_builds_polymarket_market_subscription() {
 }
 
 #[test]
+fn live_collector_config_builds_coinbase_reference_subscription() {
+    let config = LiveCollectorConfig::from_env_values(
+        Some("true"),
+        Some("btc-updown-5m-1769000000"),
+        Some("btc-updown-5m"),
+        Some("yes-token,no-token"),
+        Some("UP,DOWN"),
+        None,
+        Some("/tmp/regime-fallback.ndjson"),
+        Some("1500"),
+    )
+    .expect("collector config");
+
+    assert_eq!(
+        config.reference_subscription_message(),
+        serde_json::json!({
+            "type": "subscribe",
+            "product_ids": ["BTC-USD"],
+            "channels": ["ticker", "heartbeat"]
+        })
+    );
+}
+
+#[test]
 fn market_ticks_from_price_change_preserves_asset_outcome_and_receive_lag() {
     let config = LiveCollectorConfig::from_env_values(
         Some("true"),
@@ -89,6 +114,43 @@ fn market_ticks_from_price_change_preserves_asset_outcome_and_receive_lag() {
     assert_eq!(ticks[0].side, "BUY");
     assert_eq!(ticks[0].outcome, "UP");
     assert_eq!(ticks[0].receive_lag_ms, 150);
+}
+
+#[test]
+fn coinbase_ticker_message_converts_to_reference_market_tick() {
+    let config = LiveCollectorConfig::from_env_values(
+        Some("true"),
+        Some("btc-updown-5m-1769000000"),
+        Some("btc-updown-5m"),
+        Some("yes-token,no-token"),
+        Some("UP,DOWN"),
+        None,
+        Some("/tmp/regime-fallback.ndjson"),
+        Some("1500"),
+    )
+    .expect("collector config");
+
+    let tick = reference_tick_from_coinbase_message(
+        r#"{
+          "type": "ticker",
+          "product_id": "BTC-USD",
+          "price": "65000.25",
+          "time": "1970-01-01T00:00:01.250Z"
+        }"#,
+        &config,
+        1_500,
+    )
+    .expect("reference tick")
+    .expect("ticker record");
+
+    assert_eq!(tick.timestamp_ms, 1_250);
+    assert_eq!(tick.meta.slug, "btc-updown-5m-1769000000");
+    assert_eq!(tick.meta.source, "coinbase");
+    assert_eq!(tick.price, 65000.25);
+    assert_eq!(tick.size, 0.0);
+    assert_eq!(tick.side, "TICKER");
+    assert_eq!(tick.outcome, "BTC-USD");
+    assert_eq!(tick.receive_lag_ms, 250);
 }
 
 #[test]
