@@ -1,10 +1,12 @@
 use axum::{
     Json, Router,
+    http::StatusCode,
     routing::{get, post},
 };
 use regime_core::{
-    AlertRecord, PricePoint, ShiftLabel, ShiftLabelConfig, ValidationReport, generate_shift_labels,
-    validate_alerts,
+    AlertRecord, FeatureWindowRecord, PricePoint, ScoreThresholds, ScoreWeights, ShiftLabel,
+    ShiftLabelConfig, ValidationReport, generate_alerts_from_feature_windows,
+    generate_shift_labels, validate_alerts,
 };
 use serde::{Deserialize, Serialize};
 
@@ -648,13 +650,20 @@ struct HealthResponse {
 #[derive(Debug, Deserialize)]
 pub struct ReplayValidationRequest {
     price_points: Vec<PricePoint>,
+    #[serde(default)]
     alerts: Vec<AlertRecord>,
+    #[serde(default)]
+    feature_windows: Vec<FeatureWindowRecord>,
+    score_weights: Option<ScoreWeights>,
+    score_thresholds: Option<ScoreThresholds>,
+    alert_horizon_ms: Option<i64>,
     label_config: ShiftLabelConfig,
     synchronous_tolerance_ms: i64,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ReplayValidationResponse {
+    alerts: Vec<AlertRecord>,
     labels: Vec<ShiftLabel>,
     report: ValidationReport,
 }
@@ -674,9 +683,55 @@ async fn health() -> Json<HealthResponse> {
 
 async fn validate_replay(
     Json(request): Json<ReplayValidationRequest>,
-) -> Json<ReplayValidationResponse> {
+) -> Result<Json<ReplayValidationResponse>, (StatusCode, String)> {
+    let alerts = replay_alerts(&request)?;
     let labels = generate_shift_labels(&request.price_points, &request.label_config);
-    let report = validate_alerts(&request.alerts, &labels, request.synchronous_tolerance_ms);
+    let report = validate_alerts(&alerts, &labels, request.synchronous_tolerance_ms);
 
-    Json(ReplayValidationResponse { labels, report })
+    Ok(Json(ReplayValidationResponse {
+        alerts,
+        labels,
+        report,
+    }))
+}
+
+fn replay_alerts(
+    request: &ReplayValidationRequest,
+) -> Result<Vec<AlertRecord>, (StatusCode, String)> {
+    if !request.alerts.is_empty() {
+        return Ok(request.alerts.clone());
+    }
+
+    if request.feature_windows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let Some(weights) = request.score_weights else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "score_weights are required when feature_windows are provided without alerts"
+                .to_string(),
+        ));
+    };
+    let Some(thresholds) = request.score_thresholds else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "score_thresholds are required when feature_windows are provided without alerts"
+                .to_string(),
+        ));
+    };
+    let Some(horizon_ms) = request.alert_horizon_ms else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "alert_horizon_ms is required when feature_windows are provided without alerts"
+                .to_string(),
+        ));
+    };
+
+    Ok(generate_alerts_from_feature_windows(
+        &request.feature_windows,
+        &weights,
+        &thresholds,
+        horizon_ms,
+    ))
 }
