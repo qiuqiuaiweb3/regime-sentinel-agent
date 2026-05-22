@@ -1,6 +1,8 @@
+use serde::{Deserialize, Serialize};
+
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Serialize)]
 pub struct FeatureSnapshot {
     pub fair_gap_velocity: f64,
     pub depth_imbalance: f64,
@@ -12,7 +14,7 @@ pub struct FeatureSnapshot {
     pub liquidity_reliable: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Serialize)]
 pub struct ScoreWeights {
     pub fair_gap_velocity: f64,
     pub depth_imbalance: f64,
@@ -21,14 +23,14 @@ pub struct ScoreWeights {
     pub stale_data_penalty: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Serialize)]
 pub struct ScoreThresholds {
     pub watch: f64,
     pub early_risk: f64,
     pub shift_detected_move: f64,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
 pub enum AlertState {
     Equilibrium,
     Watch,
@@ -36,39 +38,39 @@ pub enum AlertState {
     ShiftDetected,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
 pub enum AlertConfidence {
     Normal,
     Low,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Serialize)]
 pub struct AlertDecision {
     pub state: AlertState,
     pub confidence: AlertConfidence,
     pub score: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Serialize)]
 pub struct PricePoint {
     pub timestamp_ms: i64,
     pub p_mid: f64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 pub struct ShiftLabelConfig {
     pub horizons_ms: Vec<i64>,
     pub min_move: f64,
     pub persist_ms: i64,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ShiftDirection {
     Up,
     Down,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Serialize)]
 pub struct ShiftLabel {
     pub baseline_time_ms: i64,
     pub onset_time_ms: i64,
@@ -77,7 +79,7 @@ pub struct ShiftLabel {
     pub magnitude: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Serialize)]
 pub struct AlertRecord {
     pub timestamp_ms: i64,
     pub state: AlertState,
@@ -86,7 +88,7 @@ pub struct AlertRecord {
     pub score: f64,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
 pub enum DetectionTiming {
     Early,
     Synchronous,
@@ -94,7 +96,7 @@ pub enum DetectionTiming {
     FalseAlert,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Serialize)]
 pub struct AlertValidationResult {
     pub alert_time_ms: i64,
     pub shift_onset_time_ms: Option<i64>,
@@ -103,7 +105,7 @@ pub struct AlertValidationResult {
     pub timing: DetectionTiming,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ValidationSummary {
     pub total_alerts: usize,
     pub early: usize,
@@ -112,7 +114,7 @@ pub struct ValidationSummary {
     pub false_alerts: usize,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 pub struct ValidationReport {
     pub results: Vec<AlertValidationResult>,
     pub summary: ValidationSummary,
