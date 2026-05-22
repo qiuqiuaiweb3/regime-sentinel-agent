@@ -1,5 +1,8 @@
 use mongodb::bson::Bson;
-use regime_core::{FeatureWindowMetrics, MarketTickMeta, MarketTickRecord, build_feature_window};
+use regime_core::{
+    AlertEventRecord, FeatureWindowMetrics, MarketTickMeta, MarketTickRecord, RegimeStateRecord,
+    build_feature_window,
+};
 
 #[test]
 fn feature_window_document_matches_mongodb_schema_fields() {
@@ -97,4 +100,67 @@ fn market_tick_insert_matches_time_series_schema() {
     assert_eq!(insert.document.get_f64("size"), Ok(100.0));
     assert_eq!(insert.document.get_str("side"), Ok("BUY"));
     assert_eq!(insert.document.get_i64("receive_lag_ms"), Ok(120));
+}
+
+#[test]
+fn regime_state_upsert_matches_latest_state_schema() {
+    let state = RegimeStateRecord {
+        id: "btc-updown-5m".to_string(),
+        regime: "EARLY_SHIFT_RISK".to_string(),
+        confidence: 0.71,
+        updated_at_ms: 1_769_000_000_456,
+        previous_regime: "EQUILIBRIUM".to_string(),
+        indicators: serde_json::json!({"ofi_1s": 0.42}),
+        market_resolved: false,
+    };
+
+    let upsert = regime_service::mongo_documents::regime_state_upsert(&state);
+
+    assert_eq!(upsert.collection_name, "regime_states");
+    assert!(upsert.upsert);
+    assert_eq!(upsert.filter.get_str("_id"), Ok("btc-updown-5m"));
+
+    let set = upsert.update.get_document("$set").expect("$set document");
+    assert_eq!(set.get_str("regime"), Ok("EARLY_SHIFT_RISK"));
+    assert_eq!(set.get_f64("confidence"), Ok(0.71));
+    assert_eq!(
+        set.get_datetime("updated_at")
+            .map(|value| value.timestamp_millis()),
+        Ok(1_769_000_000_456)
+    );
+    assert_eq!(
+        set.get_document("indicators")
+            .and_then(|indicators| indicators.get_f64("ofi_1s")),
+        Ok(0.42)
+    );
+    assert_eq!(set.get_bool("market_resolved"), Ok(false));
+}
+
+#[test]
+fn alert_insert_matches_alert_schema() {
+    let alert = AlertEventRecord {
+        slug: "btc-updown-5m".to_string(),
+        created_at_ms: 1_769_000_000_789,
+        severity: "HIGH".to_string(),
+        state: "EARLY_RISK".to_string(),
+        direction: "UP".to_string(),
+        trigger: "fair_gap_velocity+ofi_1s".to_string(),
+        message: "Up-side pressure rising before price fully reprices".to_string(),
+        gemini_explained: false,
+    };
+
+    let insert = regime_service::mongo_documents::alert_insert(&alert);
+
+    assert_eq!(insert.collection_name, "alerts");
+    assert_eq!(insert.document.get_str("slug"), Ok("btc-updown-5m"));
+    assert_eq!(
+        insert
+            .document
+            .get_datetime("created_at")
+            .map(|value| value.timestamp_millis()),
+        Ok(1_769_000_000_789)
+    );
+    assert_eq!(insert.document.get_str("severity"), Ok("HIGH"));
+    assert_eq!(insert.document.get_str("state"), Ok("EARLY_RISK"));
+    assert_eq!(insert.document.get_bool("gemini_explained"), Ok(false));
 }

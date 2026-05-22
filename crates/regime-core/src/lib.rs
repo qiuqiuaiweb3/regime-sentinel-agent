@@ -59,6 +59,29 @@ pub struct MarketTickRecord {
     pub receive_lag_ms: i64,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
+pub struct RegimeStateRecord {
+    pub id: String,
+    pub regime: String,
+    pub confidence: f64,
+    pub updated_at_ms: i64,
+    pub previous_regime: String,
+    pub indicators: serde_json::Value,
+    pub market_resolved: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AlertEventRecord {
+    pub slug: String,
+    pub created_at_ms: i64,
+    pub severity: String,
+    pub state: String,
+    pub direction: String,
+    pub trigger: String,
+    pub message: String,
+    pub gemini_explained: bool,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Serialize)]
 pub struct ScoreWeights {
     pub fair_gap_velocity: f64,

@@ -284,12 +284,20 @@ pub mod mongo_bootstrap {
 
 pub mod mongo_documents {
     use mongodb::bson::{Bson, DateTime, Document, doc};
-    use regime_core::{FeatureWindowRecord, MarketTickRecord};
+    use regime_core::{AlertEventRecord, FeatureWindowRecord, MarketTickRecord, RegimeStateRecord};
 
     #[derive(Debug, Clone)]
     pub struct MongoInsertDocument {
         pub collection_name: &'static str,
         pub document: Document,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct MongoUpdateDocument {
+        pub collection_name: &'static str,
+        pub filter: Document,
+        pub update: Document,
+        pub upsert: bool,
     }
 
     pub fn feature_window_insert(window: &FeatureWindowRecord) -> MongoInsertDocument {
@@ -303,6 +311,26 @@ pub mod mongo_documents {
         MongoInsertDocument {
             collection_name: "market_ticks",
             document: market_tick_document(tick),
+        }
+    }
+
+    pub fn regime_state_upsert(state: &RegimeStateRecord) -> MongoUpdateDocument {
+        MongoUpdateDocument {
+            collection_name: "regime_states",
+            filter: doc! {
+                "_id": &state.id,
+            },
+            update: doc! {
+                "$set": regime_state_document(state),
+            },
+            upsert: true,
+        }
+    }
+
+    pub fn alert_insert(alert: &AlertEventRecord) -> MongoInsertDocument {
+        MongoInsertDocument {
+            collection_name: "alerts",
+            document: alert_document(alert),
         }
     }
 
@@ -344,13 +372,40 @@ pub mod mongo_documents {
             "receive_lag_ms": tick.receive_lag_ms,
         }
     }
+
+    pub fn regime_state_document(state: &RegimeStateRecord) -> Document {
+        doc! {
+            "regime": &state.regime,
+            "confidence": state.confidence,
+            "updated_at": DateTime::from_millis(state.updated_at_ms),
+            "previous_regime": &state.previous_regime,
+            "indicators": mongodb::bson::to_bson(&state.indicators)
+                .expect("serde_json indicators convert to BSON"),
+            "market_resolved": state.market_resolved,
+        }
+    }
+
+    pub fn alert_document(alert: &AlertEventRecord) -> Document {
+        doc! {
+            "slug": &alert.slug,
+            "created_at": DateTime::from_millis(alert.created_at_ms),
+            "severity": &alert.severity,
+            "state": &alert.state,
+            "direction": &alert.direction,
+            "trigger": &alert.trigger,
+            "message": &alert.message,
+            "gemini_explained": alert.gemini_explained,
+        }
+    }
 }
 
 pub mod mongo_store {
     use mongodb::{Database, bson::Document};
-    use regime_core::{FeatureWindowRecord, MarketTickRecord};
+    use regime_core::{AlertEventRecord, FeatureWindowRecord, MarketTickRecord, RegimeStateRecord};
 
-    use crate::mongo_documents::{feature_window_insert, market_tick_insert};
+    use crate::mongo_documents::{
+        alert_insert, feature_window_insert, market_tick_insert, regime_state_upsert,
+    };
 
     #[derive(Debug, Clone)]
     pub struct MongoStore {
@@ -380,6 +435,30 @@ pub mod mongo_store {
             tick: &MarketTickRecord,
         ) -> mongodb::error::Result<()> {
             let insert = market_tick_insert(tick);
+            self.db
+                .collection::<Document>(insert.collection_name)
+                .insert_one(insert.document)
+                .await?;
+
+            Ok(())
+        }
+
+        pub async fn upsert_regime_state(
+            &self,
+            state: &RegimeStateRecord,
+        ) -> mongodb::error::Result<()> {
+            let update = regime_state_upsert(state);
+            self.db
+                .collection::<Document>(update.collection_name)
+                .update_one(update.filter, update.update)
+                .upsert(update.upsert)
+                .await?;
+
+            Ok(())
+        }
+
+        pub async fn insert_alert(&self, alert: &AlertEventRecord) -> mongodb::error::Result<()> {
+            let insert = alert_insert(alert);
             self.db
                 .collection::<Document>(insert.collection_name)
                 .insert_one(insert.document)
