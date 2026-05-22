@@ -406,6 +406,7 @@ pub mod mongo_store {
     use crate::mongo_documents::{
         alert_insert, feature_window_insert, market_tick_insert, regime_state_upsert,
     };
+    use crate::similar_windows::similar_windows_pipeline;
 
     #[derive(Debug, Clone)]
     pub struct MongoStore {
@@ -465,6 +466,26 @@ pub mod mongo_store {
                 .await?;
 
             Ok(())
+        }
+
+        pub async fn find_similar_windows(
+            &self,
+            slug: &str,
+            query_vector: &[f64],
+            limit: u32,
+        ) -> mongodb::error::Result<Vec<Document>> {
+            let mut cursor = self
+                .db
+                .collection::<Document>("feature_windows")
+                .aggregate(similar_windows_pipeline(slug, query_vector, limit))
+                .await?;
+            let mut documents = Vec::new();
+
+            while cursor.advance().await? {
+                documents.push(cursor.deserialize_current()?);
+            }
+
+            Ok(documents)
         }
     }
 }
