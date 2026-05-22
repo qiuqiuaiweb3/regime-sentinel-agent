@@ -490,6 +490,82 @@ pub mod mongo_store {
     }
 }
 
+pub mod gemini_throttle {
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+    pub struct GeminiThrottleConfig {
+        pub enabled: bool,
+        pub summary_interval_minutes: u64,
+        pub max_calls_per_hour: u32,
+    }
+
+    impl GeminiThrottleConfig {
+        pub fn from_env_values(
+            enabled: Option<&str>,
+            summary_interval_minutes: Option<&str>,
+            max_calls_per_hour: Option<&str>,
+        ) -> Result<Self, String> {
+            let enabled = parse_bool(enabled.unwrap_or("false"))?;
+            let summary_interval_minutes = parse_u64(
+                summary_interval_minutes.unwrap_or("30"),
+                "GEMINI_SUMMARY_INTERVAL_MINUTES",
+            )?;
+            if summary_interval_minutes < 15 {
+                return Err("GEMINI_SUMMARY_INTERVAL_MINUTES must be at least 15".to_string());
+            }
+
+            let max_calls_per_hour = parse_u32(
+                max_calls_per_hour.unwrap_or("2"),
+                "GEMINI_MAX_CALLS_PER_HOUR",
+            )?;
+            if max_calls_per_hour == 0 {
+                return Err("GEMINI_MAX_CALLS_PER_HOUR must be greater than 0".to_string());
+            }
+
+            Ok(Self {
+                enabled,
+                summary_interval_minutes,
+                max_calls_per_hour,
+            })
+        }
+
+        pub fn should_start_summary(
+            &self,
+            now_ms: i64,
+            last_summary_at_ms: Option<i64>,
+            calls_started_in_last_hour: u32,
+        ) -> bool {
+            if !self.enabled || calls_started_in_last_hour >= self.max_calls_per_hour {
+                return false;
+            }
+
+            let Some(last_summary_at_ms) = last_summary_at_ms else {
+                return true;
+            };
+
+            let elapsed_ms = now_ms.saturating_sub(last_summary_at_ms);
+            elapsed_ms >= (self.summary_interval_minutes as i64) * 60_000
+        }
+    }
+
+    fn parse_bool(raw: &str) -> Result<bool, String> {
+        match raw {
+            "true" | "1" | "yes" => Ok(true),
+            "false" | "0" | "no" => Ok(false),
+            _ => Err("GEMINI_ENABLED must be true or false".to_string()),
+        }
+    }
+
+    fn parse_u64(raw: &str, name: &str) -> Result<u64, String> {
+        raw.parse::<u64>()
+            .map_err(|_| format!("{name} must be an unsigned integer"))
+    }
+
+    fn parse_u32(raw: &str, name: &str) -> Result<u32, String> {
+        raw.parse::<u32>()
+            .map_err(|_| format!("{name} must be an unsigned integer"))
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     status: &'static str,
