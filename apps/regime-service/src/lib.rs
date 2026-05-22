@@ -961,11 +961,28 @@ pub mod gemini_summary {
         "https://generativelanguage.googleapis.com/v1beta";
     pub const DEFAULT_GEMINI_MODEL: &str = "gemini-3-pro-preview";
     pub const DEFAULT_GEMINI_THINKING_LEVEL: &str = "low";
+    pub const DEFAULT_GEMINI_LOCATION: &str = "global";
+
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+    pub enum GeminiProvider {
+        VertexAi,
+        DeveloperApi,
+    }
+
+    #[derive(Debug, Clone, Eq, PartialEq)]
+    pub enum GeminiAuth {
+        ApiKey(String),
+        BearerToken(String),
+    }
 
     #[derive(Debug, Clone, PartialEq)]
     pub struct GeminiSummaryConfig {
         pub throttle: GeminiThrottleConfig,
+        pub provider: GeminiProvider,
         pub api_key: Option<String>,
+        pub access_token: Option<String>,
+        pub project_id: Option<String>,
+        pub location: String,
         pub model: String,
         pub endpoint_base: String,
         pub thinking_level: String,
@@ -974,11 +991,12 @@ pub mod gemini_summary {
     #[derive(Debug, Clone, PartialEq)]
     pub struct GeminiGenerateRequest {
         pub url: String,
-        pub api_key: String,
+        pub auth: Option<GeminiAuth>,
         pub body: Value,
     }
 
     impl GeminiSummaryConfig {
+        #[allow(clippy::too_many_arguments)]
         pub fn from_env_values(
             enabled: Option<&str>,
             summary_interval_minutes: Option<&str>,
@@ -986,6 +1004,10 @@ pub mod gemini_summary {
             api_key: Option<&str>,
             model: Option<&str>,
             endpoint_base: Option<&str>,
+            provider: Option<&str>,
+            project_id: Option<&str>,
+            location: Option<&str>,
+            access_token: Option<&str>,
         ) -> Result<Self, String> {
             Ok(Self {
                 throttle: GeminiThrottleConfig::from_env_values(
@@ -993,7 +1015,11 @@ pub mod gemini_summary {
                     summary_interval_minutes,
                     max_calls_per_hour,
                 )?,
+                provider: parse_provider(provider.unwrap_or("vertex"))?,
                 api_key: api_key.map(str::to_string),
+                access_token: access_token.map(str::to_string),
+                project_id: project_id.map(str::to_string),
+                location: location.unwrap_or(DEFAULT_GEMINI_LOCATION).to_string(),
                 model: model.unwrap_or(DEFAULT_GEMINI_MODEL).to_string(),
                 endpoint_base: endpoint_base
                     .unwrap_or(DEFAULT_GEMINI_ENDPOINT_BASE)
@@ -1013,6 +1039,13 @@ pub mod gemini_summary {
                 std::env::var("GEMINI_API_KEY").ok().as_deref(),
                 std::env::var("GEMINI_MODEL").ok().as_deref(),
                 std::env::var("GEMINI_ENDPOINT_BASE").ok().as_deref(),
+                std::env::var("GEMINI_PROVIDER").ok().as_deref(),
+                std::env::var("GOOGLE_CLOUD_PROJECT").ok().as_deref(),
+                std::env::var("GEMINI_LOCATION")
+                    .or_else(|_| std::env::var("GOOGLE_CLOUD_REGION"))
+                    .ok()
+                    .as_deref(),
+                std::env::var("GEMINI_ACCESS_TOKEN").ok().as_deref(),
             )
         }
     }
@@ -1021,30 +1054,88 @@ pub mod gemini_summary {
         config: &GeminiSummaryConfig,
         prompt: &str,
     ) -> Result<GeminiGenerateRequest, String> {
-        let api_key = config.api_key.clone().ok_or_else(|| {
-            "GEMINI_API_KEY is required when Gemini summaries are enabled".to_string()
-        })?;
-        Ok(GeminiGenerateRequest {
-            url: format!(
-                "{}/models/{}:generateContent",
-                config.endpoint_base, config.model
-            ),
-            api_key,
-            body: json!({
-                "contents": [
-                    {
-                        "role": "user",
-                        "parts": [
-                            { "text": prompt }
-                        ]
-                    }
-                ],
-                "generationConfig": {
-                    "temperature": 0.2,
-                    "maxOutputTokens": 256
+        let body = json!({
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        { "text": prompt }
+                    ]
                 }
-            }),
-        })
+            ],
+            "generationConfig": {
+                "temperature": 0.2,
+                "maxOutputTokens": 1024,
+                "thinkingConfig": {
+                    "thinkingLevel": config.thinking_level.to_ascii_uppercase()
+                }
+            }
+        });
+
+        match config.provider {
+            GeminiProvider::DeveloperApi => {
+                let api_key = config.api_key.clone().ok_or_else(|| {
+                    "GEMINI_API_KEY is required when GEMINI_PROVIDER=developer_api".to_string()
+                })?;
+                Ok(GeminiGenerateRequest {
+                    url: format!(
+                        "{}/models/{}:generateContent",
+                        config.endpoint_base, config.model
+                    ),
+                    auth: Some(GeminiAuth::ApiKey(api_key)),
+                    body,
+                })
+            }
+            GeminiProvider::VertexAi => {
+                let project_id = config.project_id.as_deref().ok_or_else(|| {
+                    "GOOGLE_CLOUD_PROJECT is required when GEMINI_PROVIDER=vertex".to_string()
+                })?;
+                Ok(GeminiGenerateRequest {
+                    url: format!(
+                        "{}/projects/{}/locations/{}/publishers/google/models/{}:generateContent",
+                        vertex_endpoint_base(&config.location),
+                        project_id,
+                        config.location,
+                        config.model
+                    ),
+                    auth: config.access_token.clone().map(GeminiAuth::BearerToken),
+                    body,
+                })
+            }
+        }
+    }
+
+    fn parse_provider(raw: &str) -> Result<GeminiProvider, String> {
+        match raw {
+            "vertex" | "vertex_ai" => Ok(GeminiProvider::VertexAi),
+            "developer_api" | "api_key" => Ok(GeminiProvider::DeveloperApi),
+            _ => Err("GEMINI_PROVIDER must be vertex or developer_api".to_string()),
+        }
+    }
+
+    fn vertex_endpoint_base(location: &str) -> String {
+        if location == "global" {
+            "https://aiplatform.googleapis.com/v1".to_string()
+        } else {
+            format!("https://{location}-aiplatform.googleapis.com/v1")
+        }
+    }
+
+    async fn metadata_access_token(client: &reqwest::Client) -> anyhow::Result<String> {
+        let body = client
+            .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token")
+            .header("Metadata-Flavor", "Google")
+            .send()
+            .await
+            .context("request Cloud Run metadata access token")?
+            .json::<Value>()
+            .await
+            .context("decode Cloud Run metadata access token")?;
+
+        body.get("access_token")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("metadata token response did not include access_token"))
     }
 
     pub fn build_summary_prompt(state: &RegimeStateRecord, recent_alert_count: usize) -> String {
@@ -1059,6 +1150,24 @@ pub mod gemini_summary {
         )
     }
 
+    pub fn demo_summary_state(now_ms: i64) -> RegimeStateRecord {
+        RegimeStateRecord {
+            id: "btc-updown-5m-demo".to_string(),
+            regime: "EARLY_RISK".to_string(),
+            confidence: 0.71,
+            updated_at_ms: now_ms,
+            previous_regime: "WATCH".to_string(),
+            indicators: json!({
+                "fair_gap": 0.05,
+                "ofi_1s": 0.42,
+                "depth_imbalance": 0.31,
+                "volume_acceleration": 2.1,
+                "lead_time_ms": 250
+            }),
+            market_resolved: false,
+        }
+    }
+
     pub fn parse_gemini_text(value: &Value) -> Result<String, String> {
         value
             .get("candidates")
@@ -1067,12 +1176,18 @@ pub mod gemini_summary {
             .and_then(|candidate| candidate.get("content"))
             .and_then(|content| content.get("parts"))
             .and_then(Value::as_array)
-            .and_then(|parts| parts.first())
+            .and_then(|parts| {
+                parts
+                    .iter()
+                    .find(|part| part.get("text").and_then(Value::as_str).is_some())
+            })
             .and_then(|part| part.get("text"))
             .and_then(Value::as_str)
             .map(str::to_string)
             .ok_or_else(|| {
-                "Gemini response did not include candidates[0].content.parts[0].text".to_string()
+                format!(
+                    "Gemini response did not include candidates[0].content.parts[].text: {value}"
+                )
             })
     }
 
@@ -1105,10 +1220,21 @@ pub mod gemini_summary {
         prompt: &str,
     ) -> anyhow::Result<String> {
         let request = build_gemini_request(config, prompt).map_err(anyhow::Error::msg)?;
-        let response = client
-            .post(&request.url)
-            .header("x-goog-api-key", request.api_key)
-            .json(&request.body)
+        let mut builder = client.post(&request.url).json(&request.body);
+        match request.auth {
+            Some(GeminiAuth::ApiKey(api_key)) => {
+                builder = builder.header("x-goog-api-key", api_key);
+            }
+            Some(GeminiAuth::BearerToken(access_token)) => {
+                builder = builder.bearer_auth(access_token);
+            }
+            None => {
+                let access_token = metadata_access_token(client).await?;
+                builder = builder.bearer_auth(access_token);
+            }
+        }
+
+        let response = builder
             .send()
             .await
             .context("send Gemini generateContent request")?;
@@ -1157,9 +1283,9 @@ pub mod gemini_summary {
         if !config.throttle.enabled {
             return Ok(());
         }
-        if config.api_key.is_none() {
+        if config.provider == GeminiProvider::DeveloperApi && config.api_key.is_none() {
             tracing::warn!(
-                "Gemini summaries enabled without GEMINI_API_KEY; scheduler not started"
+                "Developer API Gemini summaries enabled without GEMINI_API_KEY; scheduler not started"
             );
             return Ok(());
         }

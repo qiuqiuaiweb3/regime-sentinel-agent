@@ -71,17 +71,28 @@ Required later for live/cloud runs:
 - `MONGODB_URI`
 - `MONGODB_DB`
 - `GEMINI_ENABLED`
+- `GEMINI_PROVIDER`
+- `GEMINI_LOCATION`
 - `GEMINI_SUMMARY_INTERVAL_MINUTES`
 - `GEMINI_MAX_CALLS_PER_HOUR`
 
-Gemini is intentionally disabled by default. To enable summaries, set:
+Gemini is intentionally disabled by default. The default provider is Vertex AI.
+For a local one-off summary, set:
 
 ```bash
 GEMINI_ENABLED=true
-GEMINI_API_KEY=...
+GEMINI_PROVIDER=vertex
+GEMINI_LOCATION=global
+GEMINI_MODEL=gemini-3-flash-preview
+GEMINI_ACCESS_TOKEN="$(gcloud auth print-access-token)"
 GEMINI_SUMMARY_INTERVAL_MINUTES=30
 GEMINI_MAX_CALLS_PER_HOUR=2
+cargo run -p regime-service --bin gemini_summary_once
 ```
+
+`GEMINI_PROVIDER=developer_api` with `GEMINI_API_KEY` is kept as a fallback.
+When `MONGODB_URI` and `MONGODB_DB` are set, `gemini_summary_once` persists the
+summary to `agent_summaries`; otherwise it writes NDJSON fallback.
 
 Live collector is intentionally disabled by default. To enable it for one market:
 

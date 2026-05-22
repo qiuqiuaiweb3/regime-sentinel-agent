@@ -19,7 +19,11 @@ infrastructure or external network access.
 - Polymarket CLOB market collector core, Coinbase BTC reference collector core,
   stale-data downgrade, and NDJSON fallback.
 - Gemini summary request builder/parser/scheduler, disabled by default and gated by
-  `GEMINI_ENABLED=true` plus `GEMINI_API_KEY`.
+  `GEMINI_ENABLED=true`, with Vertex AI as the default provider and Developer API key
+  fallback.
+- Real Vertex AI Gemini summary was observed on 2026-05-23 JST with
+  `gemini-3-flash-preview`; `gemini_summary_once` returned text and persisted it to
+  MongoDB `agent_summaries`.
 - Hosted Cloud Run URL:
   `https://regime-sentinel-agent-998092298764.asia-northeast1.run.app`
 - Fixed replay demo artifacts:
@@ -56,12 +60,15 @@ cargo run -q -p regime-replay -- --input demo/replay/high-volatility-btc-window.
 cargo run -q -p regime-replay -- --input demo/replay/high-volatility-btc-window.json --format csv
 cargo run -p regime-service --bin seed_demo_mongodb
 cargo run -p regime-service --bin verify_demo_mongodb
+GEMINI_ENABLED=true GEMINI_PROVIDER=vertex GEMINI_LOCATION=global \
+  GEMINI_MODEL=gemini-3-flash-preview \
+  GEMINI_ACCESS_TOKEN="$(gcloud auth print-access-token)" \
+  cargo run -p regime-service --bin gemini_summary_once
 ```
 
 ## External Gates Not Yet Closed
 
 - Agent Builder configured in Google Cloud with `/api/openapi.json` as an OpenAPI tool.
-- Gemini summary observed in `agent_summaries` or NDJSON fallback with a real API key.
 - Live Polymarket smoke test for three real 5 minute market windows.
 - Final demo video and Devpost submission.
 
