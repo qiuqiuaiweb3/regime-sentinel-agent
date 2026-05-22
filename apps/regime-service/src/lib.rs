@@ -2276,6 +2276,11 @@ pub struct ReplayValidationResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct DashboardSnapshotQuery {
+    mode: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct AgentToolQuery {
     slug: Option<String>,
     limit: Option<i64>,
@@ -2295,10 +2300,13 @@ struct AppState {
 
 #[derive(Debug, Serialize)]
 pub struct DashboardSnapshot {
+    mode: String,
     regime: DashboardRegime,
     price_points: Vec<DashboardPricePoint>,
     alerts: Vec<DashboardAlert>,
     gemini_summary: DashboardGeminiSummary,
+    similar_windows: Vec<DashboardSimilarWindow>,
+    validation: DashboardValidation,
 }
 
 #[derive(Debug, Serialize)]
@@ -2327,7 +2335,35 @@ pub struct DashboardAlert {
 pub struct DashboardGeminiSummary {
     enabled: bool,
     generated_at_ms: Option<i64>,
+    coverage: &'static str,
     summary: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DashboardSimilarWindow {
+    slug: &'static str,
+    window_ts_ms: i64,
+    score: f64,
+    fair_gap: f64,
+    ofi_1s: f64,
+    depth_imbalance: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DashboardValidation {
+    median_lead_time_ms: Option<i64>,
+    p75_lead_time_ms: Option<i64>,
+    precision: f64,
+    recall: f64,
+    degraded_confidence: bool,
+    reason: &'static str,
+    horizons: Vec<DashboardValidationHorizon>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DashboardValidationHorizon {
+    horizon_ms: i64,
+    pr_auc: f64,
 }
 
 pub fn build_router() -> Router {
@@ -2411,9 +2447,25 @@ async fn openapi_spec() -> Json<serde_json::Value> {
                 "get": {
                     "operationId": "getDashboardSnapshot",
                     "summary": "Read current regime dashboard snapshot",
+                    "parameters": [{
+                        "name": "mode",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "type": "string",
+                            "enum": ["live", "replay"]
+                        }
+                    }],
                     "responses": {
                         "200": {
-                            "description": "Dashboard snapshot with regime, prices, alerts, and summary"
+                            "description": "Dashboard snapshot with regime, prices, alerts, summary, similar windows, and validation",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "$ref": "#/components/schemas/DashboardSnapshot"
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -2622,6 +2674,197 @@ async fn openapi_spec() -> Json<serde_json::Value> {
                         }
                     }
                 },
+                "DashboardSnapshot": {
+                    "type": "object",
+                    "required": ["mode", "regime", "price_points", "alerts", "gemini_summary", "similar_windows", "validation"],
+                    "properties": {
+                        "mode": {
+                            "type": "string",
+                            "enum": ["live", "replay"]
+                        },
+                        "regime": {
+                            "$ref": "#/components/schemas/DashboardRegime"
+                        },
+                        "price_points": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/components/schemas/DashboardPricePoint"
+                            }
+                        },
+                        "alerts": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/components/schemas/DashboardAlert"
+                            }
+                        },
+                        "gemini_summary": {
+                            "$ref": "#/components/schemas/DashboardGeminiSummary"
+                        },
+                        "similar_windows": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/components/schemas/DashboardSimilarWindow"
+                            }
+                        },
+                        "validation": {
+                            "$ref": "#/components/schemas/DashboardValidation"
+                        }
+                    }
+                },
+                "DashboardRegime": {
+                    "type": "object",
+                    "required": ["state", "confidence", "updated_at_ms"],
+                    "properties": {
+                        "state": {
+                            "type": "string"
+                        },
+                        "confidence": {
+                            "type": "string"
+                        },
+                        "updated_at_ms": {
+                            "type": "integer",
+                            "format": "int64"
+                        }
+                    }
+                },
+                "DashboardPricePoint": {
+                    "type": "object",
+                    "required": ["timestamp_ms", "p_mid", "p_fair"],
+                    "properties": {
+                        "timestamp_ms": {
+                            "type": "integer",
+                            "format": "int64"
+                        },
+                        "p_mid": {
+                            "type": "number",
+                            "format": "double"
+                        },
+                        "p_fair": {
+                            "type": "number",
+                            "format": "double"
+                        }
+                    }
+                },
+                "DashboardAlert": {
+                    "type": "object",
+                    "required": ["timestamp_ms", "state", "lead_time_ms", "score"],
+                    "properties": {
+                        "timestamp_ms": {
+                            "type": "integer",
+                            "format": "int64"
+                        },
+                        "state": {
+                            "type": "string"
+                        },
+                        "lead_time_ms": {
+                            "type": "integer",
+                            "format": "int64"
+                        },
+                        "score": {
+                            "type": "number",
+                            "format": "double"
+                        }
+                    }
+                },
+                "DashboardGeminiSummary": {
+                    "type": "object",
+                    "required": ["enabled", "generated_at_ms", "coverage", "summary"],
+                    "properties": {
+                        "enabled": {
+                            "type": "boolean"
+                        },
+                        "generated_at_ms": {
+                            "type": "integer",
+                            "format": "int64",
+                            "nullable": true
+                        },
+                        "coverage": {
+                            "type": "string"
+                        },
+                        "summary": {
+                            "type": "string"
+                        }
+                    }
+                },
+                "DashboardSimilarWindow": {
+                    "type": "object",
+                    "required": ["slug", "window_ts_ms", "score", "fair_gap", "ofi_1s", "depth_imbalance"],
+                    "properties": {
+                        "slug": {
+                            "type": "string"
+                        },
+                        "window_ts_ms": {
+                            "type": "integer",
+                            "format": "int64"
+                        },
+                        "score": {
+                            "type": "number",
+                            "format": "double"
+                        },
+                        "fair_gap": {
+                            "type": "number",
+                            "format": "double"
+                        },
+                        "ofi_1s": {
+                            "type": "number",
+                            "format": "double"
+                        },
+                        "depth_imbalance": {
+                            "type": "number",
+                            "format": "double"
+                        }
+                    }
+                },
+                "DashboardValidation": {
+                    "type": "object",
+                    "required": ["median_lead_time_ms", "p75_lead_time_ms", "precision", "recall", "degraded_confidence", "reason", "horizons"],
+                    "properties": {
+                        "median_lead_time_ms": {
+                            "type": "integer",
+                            "format": "int64",
+                            "nullable": true
+                        },
+                        "p75_lead_time_ms": {
+                            "type": "integer",
+                            "format": "int64",
+                            "nullable": true
+                        },
+                        "precision": {
+                            "type": "number",
+                            "format": "double"
+                        },
+                        "recall": {
+                            "type": "number",
+                            "format": "double"
+                        },
+                        "degraded_confidence": {
+                            "type": "boolean"
+                        },
+                        "reason": {
+                            "type": "string"
+                        },
+                        "horizons": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/components/schemas/DashboardValidationHorizon"
+                            }
+                        }
+                    }
+                },
+                "DashboardValidationHorizon": {
+                    "type": "object",
+                    "required": ["horizon_ms", "pr_auc"],
+                    "properties": {
+                        "horizon_ms": {
+                            "type": "integer",
+                            "format": "int64"
+                        },
+                        "pr_auc": {
+                            "type": "number",
+                            "format": "double"
+                        }
+                    }
+                },
                 "PricePoint": {
                     "type": "object",
                     "required": ["timestamp_ms", "p_mid"],
@@ -2804,8 +3047,12 @@ async fn openapi_spec() -> Json<serde_json::Value> {
     }))
 }
 
-async fn dashboard_snapshot() -> Json<DashboardSnapshot> {
-    Json(sample_dashboard_snapshot())
+async fn dashboard_snapshot(
+    Query(query): Query<DashboardSnapshotQuery>,
+) -> Json<DashboardSnapshot> {
+    Json(sample_dashboard_snapshot(dashboard_mode(
+        query.mode.as_deref(),
+    )))
 }
 
 async fn dashboard_events() -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
@@ -2813,7 +3060,7 @@ async fn dashboard_events() -> Sse<impl futures_util::Stream<Item = Result<Event
         tokio::time::interval(Duration::from_secs(1)),
         |mut interval| async {
             interval.tick().await;
-            let data = serde_json::to_string(&sample_dashboard_snapshot())
+            let data = serde_json::to_string(&sample_dashboard_snapshot("live"))
                 .expect("dashboard snapshot serializes");
             Some((Ok(Event::default().event("snapshot").data(data)), interval))
         },
@@ -2822,8 +3069,16 @@ async fn dashboard_events() -> Sse<impl futures_util::Stream<Item = Result<Event
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-fn sample_dashboard_snapshot() -> DashboardSnapshot {
+fn dashboard_mode(mode: Option<&str>) -> &'static str {
+    match mode {
+        Some("replay") => "replay",
+        _ => "live",
+    }
+}
+
+fn sample_dashboard_snapshot(mode: &str) -> DashboardSnapshot {
     DashboardSnapshot {
+        mode: mode.to_string(),
         regime: DashboardRegime {
             state: "EARLY_RISK",
             confidence: "Normal",
@@ -2853,9 +3108,40 @@ fn sample_dashboard_snapshot() -> DashboardSnapshot {
             score: 1.94,
         }],
         gemini_summary: DashboardGeminiSummary {
-            enabled: false,
-            generated_at_ms: None,
-            summary: "Gemini summaries are disabled by default.",
+            enabled: true,
+            generated_at_ms: Some(1_769_000_001_000),
+            coverage: "last 30 minutes",
+            summary: "Cached demo summary: early risk increased because fair-gap velocity, order flow, and depth imbalance moved in the same direction.",
+        },
+        similar_windows: vec![DashboardSimilarWindow {
+            slug: "btc-updown-5m-1768999700",
+            window_ts_ms: 1_768_999_700_750,
+            score: 0.98,
+            fair_gap: 0.05,
+            ofi_1s: 0.42,
+            depth_imbalance: 0.31,
+        }],
+        validation: DashboardValidation {
+            median_lead_time_ms: Some(250),
+            p75_lead_time_ms: Some(250),
+            precision: 1.0,
+            recall: 0.333,
+            degraded_confidence: true,
+            reason: "5s and 30s horizons need more live evidence.",
+            horizons: vec![
+                DashboardValidationHorizon {
+                    horizon_ms: 1_000,
+                    pr_auc: 1.0,
+                },
+                DashboardValidationHorizon {
+                    horizon_ms: 5_000,
+                    pr_auc: 0.0,
+                },
+                DashboardValidationHorizon {
+                    horizon_ms: 30_000,
+                    pr_auc: 0.0,
+                },
+            ],
         },
     }
 }

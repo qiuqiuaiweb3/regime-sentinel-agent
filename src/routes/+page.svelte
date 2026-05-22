@@ -7,7 +7,8 @@
     Database,
     Play,
     RefreshCw,
-    Sparkles
+    Sparkles,
+    ToggleLeft
   } from '@lucide/svelte';
   import {
     CrosshairMode,
@@ -19,6 +20,7 @@
   import {
     fallbackDashboardSnapshot,
     fetchDashboardSnapshot,
+    normalizeDashboardSnapshot,
     snapshotToDashboardView,
     type DashboardSnapshot
   } from '$lib/dashboard';
@@ -30,6 +32,7 @@
   let snapshot: DashboardSnapshot = fallbackDashboardSnapshot;
   let dashboardView = snapshotToDashboardView(snapshot);
   let horizon = '1s';
+  let mode: 'live' | 'replay' = 'live';
   let geminiEnabled = dashboardView.geminiEnabled;
   let runState = 'fallback';
 
@@ -46,11 +49,17 @@
   async function refreshDashboard() {
     runState = 'loading';
     try {
-      applySnapshot(await fetchDashboardSnapshot(fetch));
+      applySnapshot(await fetchDashboardSnapshot(fetch, mode));
       runState = 'snapshot';
     } catch {
       runState = 'fallback';
     }
+  }
+
+  function setMode(nextMode: 'live' | 'replay') {
+    mode = nextMode;
+    runState = nextMode;
+    void refreshDashboard();
   }
 
   onMount(() => {
@@ -98,8 +107,10 @@
     const events = new EventSource('/api/dashboard/events');
     events.addEventListener('snapshot', (event) => {
       try {
-        applySnapshot(JSON.parse((event as MessageEvent).data) as DashboardSnapshot);
-        runState = 'streaming';
+        if (mode === 'live') {
+          applySnapshot(normalizeDashboardSnapshot(JSON.parse((event as MessageEvent).data)));
+          runState = 'streaming';
+        }
       } catch {
         runState = 'stream-error';
       }
@@ -118,6 +129,7 @@
   });
 
   function replay() {
+    mode = 'replay';
     runState = 'replayed';
     void refreshDashboard();
   }
@@ -193,16 +205,34 @@
             <Sparkles size={16} class="text-violet-700" />
           </div>
           <p class="mt-2 text-xl font-semibold text-slate-950">{geminiEnabled ? '15 min' : 'Off'}</p>
+          <p class="mt-1 text-xs text-slate-500">{dashboardView.geminiGeneratedAt}</p>
         </div>
       </div>
 
       <div class="rounded-md border border-slate-200 bg-white">
         <div class="flex flex-col gap-3 border-b border-slate-200 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
           <div>
-            <h2 class="text-sm font-semibold text-slate-950">Replay Window</h2>
+            <h2 class="text-sm font-semibold text-slate-950">Market Window</h2>
             <p class="text-xs text-slate-500">mid price, fair probability, and generated alert marker</p>
           </div>
-          <div class="flex items-center gap-2">
+          <div class="flex flex-wrap items-center gap-2">
+            <div class="inline-flex h-8 rounded-md border border-slate-300 bg-white p-0.5" aria-label="Run mode">
+              {#each ['live', 'replay'] as item}
+                <button
+                  class={`inline-flex h-7 items-center gap-1 rounded px-2 text-sm ${
+                    mode === item
+                      ? 'bg-[#16324f] text-white'
+                      : 'text-slate-700 hover:bg-slate-50'
+                  }`}
+                  type="button"
+                  on:click={() => setMode(item as 'live' | 'replay')}
+                  aria-label={`${item} mode`}
+                >
+                  <ToggleLeft size={14} />
+                  {item}
+                </button>
+              {/each}
+            </div>
             {#each ['1s', '5s', '30s'] as item}
               <button
                 class={`h-8 rounded-md border px-3 text-sm ${
@@ -244,11 +274,40 @@
         </div>
       </section>
 
+      <section class="rounded-md border border-slate-200 bg-white">
+        <div class="border-b border-slate-200 px-4 py-3">
+          <h2 class="text-sm font-semibold text-slate-950">Similar History</h2>
+        </div>
+        <div class="divide-y divide-slate-200">
+          {#each dashboardView.similarRows as row}
+            <div class="px-4 py-3">
+              <div class="flex items-center justify-between gap-3">
+                <p class="min-w-0 truncate text-sm font-medium text-slate-950">{row.slug}</p>
+                <span class="rounded-md bg-emerald-50 px-2 py-1 text-xs font-semibold text-emerald-700">
+                  {row.score}
+                </span>
+              </div>
+              <p class="mt-1 break-words text-xs text-slate-500">
+                {row.time}
+                <span class="mx-1">·</span>
+                gap {row.fairGap}
+                <span class="mx-1">·</span>
+                flow {row.orderFlow}
+                <span class="mx-1">·</span>
+                depth {row.depth}
+              </p>
+            </div>
+          {:else}
+            <p class="px-4 py-3 text-sm text-slate-500">No similar windows</p>
+          {/each}
+        </div>
+      </section>
+
       <section class="rounded-md border border-slate-200 bg-white p-4">
         <div class="flex items-center justify-between gap-3">
           <div>
             <h2 class="text-sm font-semibold text-slate-950">Gemini Summary</h2>
-            <p class="text-xs text-slate-500">interval floor 15 minutes</p>
+            <p class="text-xs text-slate-500">{dashboardView.geminiCoverage}</p>
           </div>
           <label class="inline-flex items-center gap-2 text-sm text-slate-700">
             <input bind:checked={geminiEnabled} class="h-4 w-4" type="checkbox" />
@@ -258,6 +317,25 @@
         <p class="mt-4 text-sm leading-6 text-slate-700">
           {dashboardView.geminiSummary}
         </p>
+        <p class="mt-3 text-xs text-slate-500">Generated {dashboardView.geminiGeneratedAt}</p>
+      </section>
+
+      <section class="rounded-md border border-slate-200 bg-white p-4">
+        <h2 class="text-sm font-semibold text-slate-950">Validation</h2>
+        <p class="mt-2 text-sm text-slate-700">{dashboardView.validationSummary}</p>
+        {#if dashboardView.degradedConfidence}
+          <p class="mt-2 rounded-md bg-amber-50 px-3 py-2 text-xs font-medium text-amber-800">
+            {dashboardView.validationReason}
+          </p>
+        {/if}
+        <div class="mt-3 grid grid-cols-3 gap-2">
+          {#each dashboardView.validationRows as row}
+            <div class="rounded-md border border-slate-200 px-3 py-2">
+              <p class="text-xs text-slate-500">{row.horizon}</p>
+              <p class="text-sm font-semibold text-slate-950">{row.prAuc}</p>
+            </div>
+          {/each}
+        </div>
       </section>
 
       <section class="rounded-md border border-slate-200 bg-white p-4">
@@ -265,7 +343,7 @@
         <dl class="mt-3 grid grid-cols-2 gap-3 text-sm">
           <div>
             <dt class="text-xs text-slate-500">Mode</dt>
-            <dd class="font-medium text-slate-950">{runState}</dd>
+            <dd class="font-medium text-slate-950">{snapshot.mode} · {runState}</dd>
           </div>
           <div>
             <dt class="text-xs text-slate-500">Horizon</dt>
@@ -277,7 +355,7 @@
           </div>
           <div>
             <dt class="text-xs text-slate-500">Vector k</dt>
-            <dd class="font-medium text-slate-950">3</dd>
+            <dd class="font-medium text-slate-950">{dashboardView.similarRows.length}</dd>
           </div>
         </dl>
       </section>

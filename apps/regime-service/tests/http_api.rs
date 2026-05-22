@@ -218,11 +218,37 @@ async fn dashboard_snapshot_endpoint_returns_replay_ready_payload() {
         .expect("snapshot body");
     let payload: Value = serde_json::from_slice(&body).expect("snapshot json");
 
+    assert_eq!(payload["mode"], "live");
     assert_eq!(payload["regime"]["state"], "EARLY_RISK");
     assert_eq!(payload["regime"]["confidence"], "Normal");
     assert_eq!(payload["price_points"][0]["p_mid"], 0.50);
     assert_eq!(payload["alerts"][0]["lead_time_ms"], 250);
-    assert_eq!(payload["gemini_summary"]["enabled"], false);
+    assert_eq!(payload["gemini_summary"]["enabled"], true);
+    assert_eq!(payload["gemini_summary"]["coverage"], "last 30 minutes");
+    assert_eq!(payload["similar_windows"][0]["score"], 0.98);
+    assert_eq!(payload["validation"]["degraded_confidence"], true);
+    assert_eq!(payload["validation"]["horizons"][0]["horizon_ms"], 1000);
+}
+
+#[tokio::test]
+async fn dashboard_snapshot_endpoint_accepts_replay_mode() {
+    let response = regime_service::build_router()
+        .oneshot(
+            Request::builder()
+                .uri("/api/dashboard/snapshot?mode=replay")
+                .body(Body::empty())
+                .expect("snapshot request"),
+        )
+        .await
+        .expect("snapshot response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("snapshot body");
+    let payload: Value = serde_json::from_slice(&body).expect("snapshot json");
+
+    assert_eq!(payload["mode"], "replay");
 }
 
 #[tokio::test]
@@ -323,6 +349,15 @@ async fn openapi_spec_exposes_agent_builder_read_tools() {
         "getDashboardSnapshot"
     );
     assert_eq!(
+        payload["paths"]["/api/dashboard/snapshot"]["get"]["parameters"][0]["name"],
+        "mode"
+    );
+    assert_eq!(
+        payload["paths"]["/api/dashboard/snapshot"]["get"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/DashboardSnapshot"
+    );
+    assert_eq!(
         payload["paths"]["/api/replay/validate"]["post"]["operationId"],
         "validateReplay"
     );
@@ -359,6 +394,14 @@ async fn openapi_spec_exposes_agent_builder_read_tools() {
     assert_eq!(
         payload["components"]["schemas"]["ReplayValidationRequest"]["required"][0],
         "price_points"
+    );
+    assert_eq!(
+        payload["components"]["schemas"]["DashboardSnapshot"]["required"][0],
+        "mode"
+    );
+    assert_eq!(
+        payload["components"]["schemas"]["DashboardGeminiSummary"]["properties"]["coverage"]["type"],
+        "string"
     );
 }
 
