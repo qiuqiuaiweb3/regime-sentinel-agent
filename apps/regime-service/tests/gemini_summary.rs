@@ -8,7 +8,7 @@ use serde_json::json;
 #[test]
 fn gemini_summary_config_defaults_to_disabled_without_api_key() {
     let config = GeminiSummaryConfig::from_env_values(
-        None, None, None, None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None, None, None, None,
     )
     .expect("gemini config");
 
@@ -24,6 +24,7 @@ fn gemini_request_uses_vertex_generate_content_shape() {
         Some("true"),
         Some("15"),
         Some("2"),
+        None,
         None,
         Some("gemini-3-pro-preview"),
         None,
@@ -60,6 +61,7 @@ fn vertex_request_can_defer_auth_to_metadata_token() {
         Some("15"),
         Some("2"),
         None,
+        None,
         Some("gemini-3-flash-preview"),
         None,
         Some("vertex"),
@@ -81,6 +83,7 @@ fn gemini_request_still_supports_developer_api_key_fallback() {
         Some("true"),
         Some("15"),
         Some("2"),
+        None,
         Some("test-key"),
         Some("gemini-3-pro-preview"),
         None,

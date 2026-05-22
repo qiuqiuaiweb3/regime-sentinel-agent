@@ -1,7 +1,8 @@
 use anyhow::{Context, bail};
 use regime_core::{
-    AblationMetric, AlertRecord, FeatureWindowRecord, PricePoint, ScoreThresholds, ScoreWeights,
-    ShiftLabel, ShiftLabelConfig, ValidationReport, ablation_report_from_feature_windows,
+    AblationMetric, AlertRecord, FairProbabilityFeatureWindowRecord, FeatureWindowRecord,
+    PricePoint, ScoreThresholds, ScoreWeights, ShiftLabel, ShiftLabelConfig, ValidationReport,
+    ablation_report_from_feature_windows, build_feature_window_from_fair_probability_record,
     generate_alerts_from_feature_windows, generate_shift_labels, validate_alerts_for_market,
 };
 use serde::{Deserialize, Serialize};
@@ -14,6 +15,8 @@ struct ReplayInput {
     alerts: Vec<AlertRecord>,
     #[serde(default)]
     feature_windows: Vec<FeatureWindowRecord>,
+    #[serde(default)]
+    fair_probability_feature_windows: Vec<FairProbabilityFeatureWindowRecord>,
     score_weights: Option<ScoreWeights>,
     score_thresholds: Option<ScoreThresholds>,
     alert_horizon_ms: Option<i64>,
@@ -72,7 +75,8 @@ fn replay_ablation(
     input: &ReplayInput,
     labels: &[ShiftLabel],
 ) -> anyhow::Result<Vec<AblationMetric>> {
-    if input.feature_windows.is_empty() {
+    let feature_windows = replay_feature_windows(input);
+    if feature_windows.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -87,7 +91,7 @@ fn replay_ablation(
     };
 
     Ok(ablation_report_from_feature_windows(
-        &input.feature_windows,
+        &feature_windows,
         labels,
         &weights,
         &thresholds,
@@ -98,10 +102,28 @@ fn replay_ablation(
 
 fn replay_market_slug(input: &ReplayInput) -> &str {
     input
-        .feature_windows
+        .fair_probability_feature_windows
         .first()
         .map(|window| window.slug.as_str())
+        .or_else(|| {
+            input
+                .feature_windows
+                .first()
+                .map(|window| window.slug.as_str())
+        })
         .unwrap_or("replay")
+}
+
+fn replay_feature_windows(input: &ReplayInput) -> Vec<FeatureWindowRecord> {
+    if !input.fair_probability_feature_windows.is_empty() {
+        return input
+            .fair_probability_feature_windows
+            .iter()
+            .map(build_feature_window_from_fair_probability_record)
+            .collect();
+    }
+
+    input.feature_windows.clone()
 }
 
 fn replay_alerts(input: &ReplayInput) -> anyhow::Result<Vec<AlertRecord>> {
@@ -109,7 +131,8 @@ fn replay_alerts(input: &ReplayInput) -> anyhow::Result<Vec<AlertRecord>> {
         return Ok(input.alerts.clone());
     }
 
-    if input.feature_windows.is_empty() {
+    let feature_windows = replay_feature_windows(input);
+    if feature_windows.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -124,7 +147,7 @@ fn replay_alerts(input: &ReplayInput) -> anyhow::Result<Vec<AlertRecord>> {
     };
 
     Ok(generate_alerts_from_feature_windows(
-        &input.feature_windows,
+        &feature_windows,
         &weights,
         &thresholds,
         horizon_ms,

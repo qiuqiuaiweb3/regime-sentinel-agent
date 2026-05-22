@@ -49,6 +49,101 @@ fn agent_tool_mongodb_timeout_defaults_and_clamps() {
 }
 
 #[tokio::test]
+async fn manual_explain_endpoint_enforces_configured_cooldown_without_mongodb() {
+    let app = regime_service::build_router_with_manual_explain_config(
+        false,
+        regime_service::gemini_throttle::GeminiThrottleConfig {
+            enabled: true,
+            summary_interval_minutes: 30,
+            max_calls_per_hour: 4,
+            manual_cooldown_seconds: 300,
+        },
+    );
+
+    let first = post_json(app.clone(), "/api/agent/explain-now", json!({})).await;
+    assert_eq!(first["status"], "generated");
+    assert_eq!(first["source"], "dry_run");
+    assert_eq!(first["generated_now"], true);
+    assert_eq!(first["cooldown_seconds"], 300);
+
+    let second = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/agent/explain-now")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .expect("manual explain request"),
+        )
+        .await
+        .expect("manual explain response");
+
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body = to_bytes(second.into_body(), usize::MAX)
+        .await
+        .expect("manual explain body");
+    let payload: Value = serde_json::from_slice(&body).expect("manual explain json");
+    assert_eq!(payload["status"], "cooldown");
+    assert_eq!(payload["retry_after_seconds"], 300);
+}
+
+#[tokio::test]
+async fn manual_explain_endpoint_reports_disabled_when_gemini_is_off() {
+    let app = regime_service::build_router_with_manual_explain_config(
+        false,
+        regime_service::gemini_throttle::GeminiThrottleConfig {
+            enabled: false,
+            summary_interval_minutes: 30,
+            max_calls_per_hour: 4,
+            manual_cooldown_seconds: 300,
+        },
+    );
+
+    let payload = post_json(app, "/api/agent/explain-now", json!({})).await;
+
+    assert_eq!(payload["status"], "disabled");
+    assert_eq!(payload["generated_now"], false);
+    assert_eq!(payload["reason"], "gemini_disabled");
+}
+
+#[tokio::test]
+async fn manual_explain_endpoint_enforces_hourly_cap() {
+    let app = regime_service::build_router_with_manual_explain_config(
+        false,
+        regime_service::gemini_throttle::GeminiThrottleConfig {
+            enabled: true,
+            summary_interval_minutes: 30,
+            max_calls_per_hour: 1,
+            manual_cooldown_seconds: 1,
+        },
+    );
+
+    let first = post_json(app.clone(), "/api/agent/explain-now", json!({})).await;
+    assert_eq!(first["status"], "generated");
+
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let second = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/agent/explain-now")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .expect("manual explain request"),
+        )
+        .await
+        .expect("manual explain response");
+
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body = to_bytes(second.into_body(), usize::MAX)
+        .await
+        .expect("manual explain body");
+    let payload: Value = serde_json::from_slice(&body).expect("manual explain json");
+    assert_eq!(payload["status"], "rate_limited");
+    assert_eq!(payload["reason"], "hourly_cap");
+}
+
+#[tokio::test]
 async fn replay_validation_endpoint_returns_lead_time_report() {
     let request_body = json!({
         "price_points": [
@@ -172,6 +267,84 @@ async fn replay_validation_endpoint_generates_alerts_from_feature_windows() {
         .await
         .expect("validation body");
     let payload: Value = serde_json::from_slice(&body).expect("validation json");
+
+    assert_eq!(payload["alerts"][0]["timestamp_ms"], 750);
+    assert_eq!(payload["report"]["summary"]["early"], 1);
+    assert_eq!(payload["report"]["results"][0]["lead_time_ms"], 250);
+    assert_eq!(payload["ablation"][0]["variant"], "baseline");
+}
+
+#[tokio::test]
+async fn replay_validation_endpoint_generates_alerts_from_fair_probability_inputs() {
+    let request_body = json!({
+        "price_points": [
+            {"timestamp_ms": 0, "p_mid": 0.50},
+            {"timestamp_ms": 1000, "p_mid": 0.62},
+            {"timestamp_ms": 4000, "p_mid": 0.61}
+        ],
+        "fair_probability_feature_windows": [
+            {
+                "slug": "btc-updown-5m",
+                "window_ts_ms": 0,
+                "window_ms": 1000,
+                "p_mid": 0.50,
+                "fair_probability": {
+                    "current_price": 100000.0,
+                    "strike_price": 100000.0,
+                    "time_remaining_ms": 60000,
+                    "realized_volatility": 0.40,
+                    "feed_lag_ms": 100
+                },
+                "ofi_1s": 0.01,
+                "depth_imbalance": 0.01,
+                "spread": 0.02,
+                "volume_acceleration": 0.01
+            },
+            {
+                "slug": "btc-updown-5m",
+                "window_ts_ms": 750,
+                "window_ms": 1000,
+                "p_mid": 0.58,
+                "fair_probability": {
+                    "current_price": 100000.0,
+                    "strike_price": 100000.0,
+                    "time_remaining_ms": 59250,
+                    "realized_volatility": 0.40,
+                    "feed_lag_ms": 100
+                },
+                "ofi_1s": 0.42,
+                "depth_imbalance": 0.31,
+                "spread": 0.03,
+                "volume_acceleration": 2.1
+            }
+        ],
+        "score_weights": {
+            "fair_gap_velocity": 4.0,
+            "depth_imbalance": 1.0,
+            "ofi_1s": 1.0,
+            "volume_acceleration": 0.5,
+            "stale_data_penalty": 1.0
+        },
+        "score_thresholds": {
+            "watch": 0.5,
+            "early_risk": 1.0,
+            "shift_detected_move": 0.10
+        },
+        "alert_horizon_ms": 1000,
+        "label_config": {
+            "horizons_ms": [1000],
+            "min_move": 0.10,
+            "persist_ms": 3000
+        },
+        "synchronous_tolerance_ms": 100
+    });
+
+    let payload = post_json(
+        regime_service::build_router(),
+        "/api/replay/validate",
+        request_body,
+    )
+    .await;
 
     assert_eq!(payload["alerts"][0]["timestamp_ms"], 750);
     assert_eq!(payload["report"]["summary"]["early"], 1);
@@ -382,6 +555,14 @@ async fn openapi_spec_exposes_agent_builder_read_tools() {
         "validateReplay"
     );
     assert_eq!(
+        payload["paths"]["/api/replay/validate"]["post"]["summary"],
+        "Validate replay alerts with strict fair-probability or legacy feature windows"
+    );
+    assert_eq!(
+        payload["paths"]["/api/replay/validate"]["post"]["description"],
+        "Use fair_probability_feature_windows for strict computed p_fair validation; feature_windows remains a legacy compatibility path for caller-provided p_fair replay fixtures."
+    );
+    assert_eq!(
         payload["paths"]["/api/agent/current-regime"]["get"]["operationId"],
         "getCurrentRegime"
     );
@@ -402,6 +583,10 @@ async fn openapi_spec_exposes_agent_builder_read_tools() {
         "generateMarketSummary"
     );
     assert_eq!(
+        payload["paths"]["/api/agent/explain-now"]["post"]["operationId"],
+        "explainNow"
+    );
+    assert_eq!(
         payload["paths"]["/api/replay/validate"]["post"]["requestBody"]["content"]["application/json"]
             ["schema"]["$ref"],
         "#/components/schemas/ReplayValidationRequest"
@@ -414,6 +599,21 @@ async fn openapi_spec_exposes_agent_builder_read_tools() {
     assert_eq!(
         payload["components"]["schemas"]["ReplayValidationRequest"]["required"][0],
         "price_points"
+    );
+    assert_eq!(
+        payload["components"]["schemas"]["ReplayValidationRequest"]["properties"]["fair_probability_feature_windows"]
+            ["items"]["$ref"],
+        "#/components/schemas/FairProbabilityFeatureWindowRecord"
+    );
+    assert_eq!(
+        payload["components"]["schemas"]["ReplayValidationRequest"]["properties"]["feature_windows"]
+            ["description"],
+        "Legacy compatibility path: accepts caller-provided p_fair/fair_gap feature windows."
+    );
+    assert_eq!(
+        payload["components"]["schemas"]["ReplayValidationRequest"]["properties"]["fair_probability_feature_windows"]
+            ["description"],
+        "Strict acceptance path: computes p_fair from current_price, strike_price, time_remaining_ms, realized_volatility, and feed_lag_ms."
     );
     assert_eq!(
         payload["components"]["schemas"]["DashboardSnapshot"]["required"][0],

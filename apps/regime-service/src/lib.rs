@@ -8,14 +8,16 @@ use axum::{
 };
 use futures_util::stream;
 use regime_core::{
-    AblationMetric, AlertRecord, FeatureWindowRecord, PricePoint, ScoreThresholds, ScoreWeights,
-    ShiftLabel, ShiftLabelConfig, ValidationReport, ablation_report_from_feature_windows,
+    AblationMetric, AlertRecord, FairProbabilityFeatureWindowRecord, FeatureWindowRecord,
+    PricePoint, ScoreThresholds, ScoreWeights, ShiftLabel, ShiftLabelConfig, ValidationReport,
+    ablation_report_from_feature_windows, build_feature_window_from_fair_probability_record,
     generate_alerts_from_feature_windows, generate_shift_labels, validate_alerts_for_market,
 };
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tower_http::services::{ServeDir, ServeFile};
 
 pub mod mongo_indexes {
@@ -941,11 +943,70 @@ pub mod demo_seed {
 }
 
 pub mod gemini_throttle {
+    use std::sync::{Arc, Mutex};
+
     #[derive(Debug, Clone, Copy, Eq, PartialEq)]
     pub struct GeminiThrottleConfig {
         pub enabled: bool,
         pub summary_interval_minutes: u64,
         pub max_calls_per_hour: u32,
+        pub manual_cooldown_seconds: u64,
+    }
+
+    #[derive(Debug, Clone, Default)]
+    pub struct GeminiCallBudget {
+        calls_started_at_ms: Arc<Mutex<Vec<i64>>>,
+    }
+
+    impl GeminiCallBudget {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        pub fn reserve_summary_call(
+            &self,
+            config: &GeminiThrottleConfig,
+            now_ms: i64,
+            last_summary_at_ms: Option<i64>,
+        ) -> bool {
+            let mut calls = self.calls_started_at_ms(now_ms);
+            if !config.should_start_summary(now_ms, last_summary_at_ms, calls.len() as u32) {
+                return false;
+            }
+            calls.push(now_ms);
+            true
+        }
+
+        pub fn reserve_manual_explain_call(
+            &self,
+            config: &GeminiThrottleConfig,
+            now_ms: i64,
+            last_manual_explain_at_ms: Option<i64>,
+        ) -> bool {
+            let mut calls = self.calls_started_at_ms(now_ms);
+            if !config.should_start_manual_explain(
+                now_ms,
+                last_manual_explain_at_ms,
+                calls.len() as u32,
+            ) {
+                return false;
+            }
+            calls.push(now_ms);
+            true
+        }
+
+        pub fn calls_started_in_last_hour(&self, now_ms: i64) -> u32 {
+            self.calls_started_at_ms(now_ms).len() as u32
+        }
+
+        fn calls_started_at_ms(&self, now_ms: i64) -> std::sync::MutexGuard<'_, Vec<i64>> {
+            let mut calls = self
+                .calls_started_at_ms
+                .lock()
+                .expect("Gemini call budget lock is not poisoned");
+            calls.retain(|started_at_ms| now_ms.saturating_sub(*started_at_ms) < 3_600_000);
+            calls
+        }
     }
 
     impl GeminiThrottleConfig {
@@ -953,6 +1014,7 @@ pub mod gemini_throttle {
             enabled: Option<&str>,
             summary_interval_minutes: Option<&str>,
             max_calls_per_hour: Option<&str>,
+            manual_cooldown_seconds: Option<&str>,
         ) -> Result<Self, String> {
             let enabled = parse_bool(enabled.unwrap_or("false"))?;
             let summary_interval_minutes = parse_u64(
@@ -970,11 +1032,19 @@ pub mod gemini_throttle {
             if max_calls_per_hour == 0 {
                 return Err("GEMINI_MAX_CALLS_PER_HOUR must be greater than 0".to_string());
             }
+            let manual_cooldown_seconds = parse_u64(
+                manual_cooldown_seconds.unwrap_or("300"),
+                "GEMINI_MANUAL_COOLDOWN_SECONDS",
+            )?;
+            if manual_cooldown_seconds == 0 {
+                return Err("GEMINI_MANUAL_COOLDOWN_SECONDS must be greater than 0".to_string());
+            }
 
             Ok(Self {
                 enabled,
                 summary_interval_minutes,
                 max_calls_per_hour,
+                manual_cooldown_seconds,
             })
         }
 
@@ -994,6 +1064,37 @@ pub mod gemini_throttle {
 
             let elapsed_ms = now_ms.saturating_sub(last_summary_at_ms);
             elapsed_ms >= (self.summary_interval_minutes as i64) * 60_000
+        }
+
+        pub fn should_start_manual_explain(
+            &self,
+            now_ms: i64,
+            last_manual_explain_at_ms: Option<i64>,
+            calls_started_in_last_hour: u32,
+        ) -> bool {
+            if !self.enabled || calls_started_in_last_hour >= self.max_calls_per_hour {
+                return false;
+            }
+
+            self.manual_retry_after_seconds(now_ms, last_manual_explain_at_ms) == Some(0)
+        }
+
+        pub fn manual_retry_after_seconds(
+            &self,
+            now_ms: i64,
+            last_manual_explain_at_ms: Option<i64>,
+        ) -> Option<u64> {
+            let Some(last_manual_explain_at_ms) = last_manual_explain_at_ms else {
+                return Some(0);
+            };
+
+            let cooldown_ms = self.manual_cooldown_seconds as i64 * 1_000;
+            let elapsed_ms = now_ms.saturating_sub(last_manual_explain_at_ms);
+            if elapsed_ms >= cooldown_ms {
+                return Some(0);
+            }
+
+            Some(((cooldown_ms - elapsed_ms) as u64).div_ceil(1_000))
         }
     }
 
@@ -1017,6 +1118,7 @@ pub mod gemini_throttle {
 }
 
 pub mod gemini_summary {
+    use crate::gemini_throttle::GeminiCallBudget;
     use crate::gemini_throttle::GeminiThrottleConfig;
     use anyhow::{Context, anyhow};
     use regime_core::{AgentSummaryRecord, RegimeStateRecord};
@@ -1068,6 +1170,7 @@ pub mod gemini_summary {
             enabled: Option<&str>,
             summary_interval_minutes: Option<&str>,
             max_calls_per_hour: Option<&str>,
+            manual_cooldown_seconds: Option<&str>,
             api_key: Option<&str>,
             model: Option<&str>,
             endpoint_base: Option<&str>,
@@ -1081,6 +1184,7 @@ pub mod gemini_summary {
                     enabled,
                     summary_interval_minutes,
                     max_calls_per_hour,
+                    manual_cooldown_seconds,
                 )?,
                 provider: parse_provider(provider.unwrap_or("vertex"))?,
                 api_key: api_key.map(str::to_string),
@@ -1103,6 +1207,10 @@ pub mod gemini_summary {
                     .ok()
                     .as_deref(),
                 std::env::var("GEMINI_MAX_CALLS_PER_HOUR").ok().as_deref(),
+                std::env::var("GEMINI_MANUAL_COOLDOWN_SECONDS")
+                    .or_else(|_| std::env::var("MANUAL_EXPLAIN_COOLDOWN_SECONDS"))
+                    .ok()
+                    .as_deref(),
                 std::env::var("GEMINI_API_KEY").ok().as_deref(),
                 std::env::var("GEMINI_MODEL").ok().as_deref(),
                 std::env::var("GEMINI_ENDPOINT_BASE").ok().as_deref(),
@@ -1346,6 +1454,7 @@ pub mod gemini_summary {
         config: GeminiSummaryConfig,
         store: Option<crate::mongo_store::MongoStore>,
         fallback_path: impl AsRef<Path>,
+        call_budget: GeminiCallBudget,
     ) -> anyhow::Result<()> {
         if !config.throttle.enabled {
             return Ok(());
@@ -1361,24 +1470,17 @@ pub mod gemini_summary {
         let fallback_path = fallback_path.as_ref().to_path_buf();
         let bucket_seconds = (config.throttle.summary_interval_minutes * 60) as i64;
         let mut last_summary_at_ms = Some(unix_timestamp_ms());
-        let mut calls_started_at_ms = Vec::new();
         let mut interval = tokio::time::interval(Duration::from_secs(60));
 
         loop {
             interval.tick().await;
             let now_ms = unix_timestamp_ms();
-            calls_started_at_ms.retain(|started_at_ms| now_ms - *started_at_ms < 3_600_000);
-            if !config.throttle.should_start_summary(
-                now_ms,
-                last_summary_at_ms,
-                calls_started_at_ms.len() as u32,
-            ) {
+            if !call_budget.reserve_summary_call(&config.throttle, now_ms, last_summary_at_ms) {
                 continue;
             }
 
             let state = scheduler_snapshot_state(now_ms);
             let prompt = build_summary_prompt(&state, 0);
-            calls_started_at_ms.push(now_ms);
             match request_gemini_summary(&client, &config, &prompt).await {
                 Ok(summary) => {
                     let record = summary_record(
@@ -2260,6 +2362,8 @@ pub struct ReplayValidationRequest {
     alerts: Vec<AlertRecord>,
     #[serde(default)]
     feature_windows: Vec<FeatureWindowRecord>,
+    #[serde(default)]
+    fair_probability_feature_windows: Vec<FairProbabilityFeatureWindowRecord>,
     score_weights: Option<ScoreWeights>,
     score_thresholds: Option<ScoreThresholds>,
     alert_horizon_ms: Option<i64>,
@@ -2296,6 +2400,26 @@ pub struct FindSimilarWindowsRequest {
 #[derive(Debug, Clone)]
 struct AppState {
     agent_tool_mongodb_enabled: bool,
+    manual_explain: ManualExplainRuntime,
+}
+
+#[derive(Debug, Clone)]
+struct ManualExplainRuntime {
+    throttle: gemini_throttle::GeminiThrottleConfig,
+    call_budget: gemini_throttle::GeminiCallBudget,
+    state: Arc<Mutex<ManualExplainState>>,
+    mode: ManualExplainMode,
+}
+
+#[derive(Debug, Default)]
+struct ManualExplainState {
+    last_started_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ManualExplainMode {
+    Generate,
+    DryRun,
 }
 
 const DEFAULT_AGENT_TOOL_MONGODB_TIMEOUT_MS: u64 = 1_500;
@@ -2383,33 +2507,80 @@ pub struct DashboardValidationHorizon {
 }
 
 pub fn build_router() -> Router {
+    build_router_with_gemini_call_budget(gemini_throttle::GeminiCallBudget::new())
+}
+
+pub fn build_router_with_gemini_call_budget(
+    call_budget: gemini_throttle::GeminiCallBudget,
+) -> Router {
     let static_dir =
         PathBuf::from(std::env::var("REGIME_STATIC_DIR").unwrap_or_else(|_| "build".to_string()));
 
     if static_dir.join("index.html").exists() {
-        return build_router_with_static_dir(static_dir);
+        return build_router_with_static_dir_and_budget(static_dir, call_budget);
     }
 
-    build_api_router()
+    build_api_router_with_budget(call_budget)
 }
 
 pub fn build_router_with_agent_tool_mongodb(enabled: bool) -> Router {
     build_api_router_with_state(AppState {
         agent_tool_mongodb_enabled: enabled,
+        manual_explain: manual_explain_runtime_from_env(
+            ManualExplainMode::Generate,
+            gemini_throttle::GeminiCallBudget::new(),
+        ),
+    })
+}
+
+pub fn build_router_with_manual_explain_config(
+    agent_tool_mongodb_enabled: bool,
+    throttle: gemini_throttle::GeminiThrottleConfig,
+) -> Router {
+    build_router_with_manual_explain_runtime(
+        agent_tool_mongodb_enabled,
+        throttle,
+        gemini_throttle::GeminiCallBudget::new(),
+        ManualExplainMode::DryRun,
+    )
+}
+
+fn build_router_with_manual_explain_runtime(
+    agent_tool_mongodb_enabled: bool,
+    throttle: gemini_throttle::GeminiThrottleConfig,
+    call_budget: gemini_throttle::GeminiCallBudget,
+    mode: ManualExplainMode,
+) -> Router {
+    build_api_router_with_state(AppState {
+        agent_tool_mongodb_enabled,
+        manual_explain: ManualExplainRuntime {
+            throttle,
+            call_budget,
+            state: Arc::new(Mutex::new(ManualExplainState::default())),
+            mode,
+        },
     })
 }
 
 pub fn build_router_with_static_dir(static_dir: impl AsRef<Path>) -> Router {
+    build_router_with_static_dir_and_budget(static_dir, gemini_throttle::GeminiCallBudget::new())
+}
+
+fn build_router_with_static_dir_and_budget(
+    static_dir: impl AsRef<Path>,
+    call_budget: gemini_throttle::GeminiCallBudget,
+) -> Router {
     let static_dir = static_dir.as_ref().to_path_buf();
     let index_file = static_dir.join("index.html");
 
-    build_api_router()
+    build_api_router_with_budget(call_budget)
         .fallback_service(ServeDir::new(static_dir).fallback(ServeFile::new(index_file)))
 }
 
-fn build_api_router() -> Router {
+fn build_api_router_with_budget(call_budget: gemini_throttle::GeminiCallBudget) -> Router {
     build_api_router_with_state(AppState {
         agent_tool_mongodb_enabled: true,
+        manual_explain: manual_explain_runtime_from_env(ManualExplainMode::Generate, call_budget),
     })
 }
 
@@ -2424,8 +2595,33 @@ fn build_api_router_with_state(state: AppState) -> Router {
         .route("/api/agent/similar-windows", post(find_similar_windows))
         .route("/api/agent/backtest-metrics", get(get_backtest_metrics))
         .route("/api/agent/market-summary", get(generate_market_summary))
+        .route("/api/agent/explain-now", post(explain_now))
         .route("/api/replay/validate", post(validate_replay))
         .with_state(state)
+}
+
+fn manual_explain_runtime_from_env(
+    mode: ManualExplainMode,
+    call_budget: gemini_throttle::GeminiCallBudget,
+) -> ManualExplainRuntime {
+    let throttle = gemini_summary::GeminiSummaryConfig::from_env()
+        .map(|config| config.throttle)
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "Gemini config invalid; manual explain disabled");
+            gemini_throttle::GeminiThrottleConfig {
+                enabled: false,
+                summary_interval_minutes: 30,
+                max_calls_per_hour: 2,
+                manual_cooldown_seconds: 300,
+            }
+        });
+
+    ManualExplainRuntime {
+        throttle,
+        call_budget,
+        state: Arc::new(Mutex::new(ManualExplainState::default())),
+        mode,
+    }
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -2599,10 +2795,28 @@ async fn openapi_spec() -> Json<serde_json::Value> {
                     }
                 }
             },
+            "/api/agent/explain-now": {
+                "post": {
+                    "operationId": "explainNow",
+                    "summary": "Run a manually requested Gemini explanation subject to cooldown and hourly call limits",
+                    "responses": {
+                        "200": {
+                            "description": "Manual explanation generated, dry-run generated, or Gemini is disabled"
+                        },
+                        "429": {
+                            "description": "Manual explanation is cooling down or hourly call cap is exhausted"
+                        },
+                        "502": {
+                            "description": "Gemini generation failed"
+                        }
+                    }
+                }
+            },
             "/api/replay/validate": {
                 "post": {
                     "operationId": "validateReplay",
-                    "summary": "Validate replay alerts against generated shift labels",
+                    "summary": "Validate replay alerts with strict fair-probability or legacy feature windows",
+                    "description": "Use fair_probability_feature_windows for strict computed p_fair validation; feature_windows remains a legacy compatibility path for caller-provided p_fair replay fixtures.",
                     "requestBody": {
                         "required": true,
                         "content": {
@@ -2641,9 +2855,18 @@ async fn openapi_spec() -> Json<serde_json::Value> {
                             "default": []
                         },
                         "feature_windows": {
+                            "description": "Legacy compatibility path: accepts caller-provided p_fair/fair_gap feature windows.",
                             "type": "array",
                             "items": {
                                 "$ref": "#/components/schemas/FeatureWindowRecord"
+                            },
+                            "default": []
+                        },
+                        "fair_probability_feature_windows": {
+                            "description": "Strict acceptance path: computes p_fair from current_price, strike_price, time_remaining_ms, realized_volatility, and feed_lag_ms.",
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/components/schemas/FairProbabilityFeatureWindowRecord"
                             },
                             "default": []
                         },
@@ -2987,6 +3210,88 @@ async fn openapi_spec() -> Json<serde_json::Value> {
                         }
                     }
                 },
+                "FairProbabilityFeatureWindowRecord": {
+                    "type": "object",
+                    "required": [
+                        "slug",
+                        "window_ts_ms",
+                        "window_ms",
+                        "p_mid",
+                        "fair_probability",
+                        "ofi_1s",
+                        "depth_imbalance",
+                        "spread",
+                        "volume_acceleration"
+                    ],
+                    "properties": {
+                        "slug": {
+                            "type": "string"
+                        },
+                        "window_ts_ms": {
+                            "type": "integer",
+                            "format": "int64"
+                        },
+                        "window_ms": {
+                            "type": "integer",
+                            "format": "int64"
+                        },
+                        "p_mid": {
+                            "type": "number",
+                            "format": "double"
+                        },
+                        "fair_probability": {
+                            "$ref": "#/components/schemas/FairProbabilityInput"
+                        },
+                        "ofi_1s": {
+                            "type": "number",
+                            "format": "double"
+                        },
+                        "depth_imbalance": {
+                            "type": "number",
+                            "format": "double"
+                        },
+                        "spread": {
+                            "type": "number",
+                            "format": "double"
+                        },
+                        "volume_acceleration": {
+                            "type": "number",
+                            "format": "double"
+                        }
+                    }
+                },
+                "FairProbabilityInput": {
+                    "type": "object",
+                    "required": [
+                        "current_price",
+                        "strike_price",
+                        "time_remaining_ms",
+                        "realized_volatility"
+                    ],
+                    "properties": {
+                        "current_price": {
+                            "type": "number",
+                            "format": "double"
+                        },
+                        "strike_price": {
+                            "type": "number",
+                            "format": "double"
+                        },
+                        "time_remaining_ms": {
+                            "type": "integer",
+                            "format": "int64"
+                        },
+                        "realized_volatility": {
+                            "type": "number",
+                            "format": "double"
+                        },
+                        "feed_lag_ms": {
+                            "type": "integer",
+                            "format": "int64",
+                            "default": 0
+                        }
+                    }
+                },
                 "ScoreWeights": {
                     "type": "object",
                     "required": [
@@ -3302,6 +3607,171 @@ async fn generate_market_summary(
     })))
 }
 
+async fn explain_now(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    let throttle = state.manual_explain.throttle;
+    if !throttle.enabled {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "disabled",
+                "reason": "gemini_disabled",
+                "generated_now": false,
+                "cooldown_seconds": throttle.manual_cooldown_seconds,
+            })),
+        );
+    }
+
+    let now_ms = unix_timestamp_ms();
+    let reserve_result = reserve_manual_explain_call(&state.manual_explain, now_ms);
+    if let Err(payload) = reserve_result {
+        return payload;
+    }
+
+    match state.manual_explain.mode {
+        ManualExplainMode::DryRun => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "generated",
+                "source": "dry_run",
+                "generated_now": true,
+                "cooldown_seconds": throttle.manual_cooldown_seconds,
+                "summary": sample_agent_summary(),
+            })),
+        ),
+        ManualExplainMode::Generate => generate_manual_explain_response(&state, now_ms).await,
+    }
+}
+
+fn reserve_manual_explain_call(
+    runtime: &ManualExplainRuntime,
+    now_ms: i64,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let mut guard = runtime
+        .state
+        .lock()
+        .expect("manual explain state lock is not poisoned");
+
+    let calls_started_in_last_hour = runtime.call_budget.calls_started_in_last_hour(now_ms);
+    if calls_started_in_last_hour >= runtime.throttle.max_calls_per_hour {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "status": "rate_limited",
+                "reason": "hourly_cap",
+                "generated_now": false,
+                "max_calls_per_hour": runtime.throttle.max_calls_per_hour,
+            })),
+        ));
+    }
+
+    let retry_after_seconds = runtime
+        .throttle
+        .manual_retry_after_seconds(now_ms, guard.last_started_at_ms)
+        .unwrap_or(0);
+    if retry_after_seconds > 0 {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "status": "cooldown",
+                "generated_now": false,
+                "retry_after_seconds": retry_after_seconds,
+                "cooldown_seconds": runtime.throttle.manual_cooldown_seconds,
+            })),
+        ));
+    }
+
+    if runtime.call_budget.reserve_manual_explain_call(
+        &runtime.throttle,
+        now_ms,
+        guard.last_started_at_ms,
+    ) {
+        guard.last_started_at_ms = Some(now_ms);
+        return Ok(());
+    }
+
+    Err((
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(serde_json::json!({
+            "status": "rate_limited",
+            "reason": "hourly_cap",
+            "generated_now": false,
+            "max_calls_per_hour": runtime.throttle.max_calls_per_hour,
+        })),
+    ))
+}
+
+async fn generate_manual_explain_response(
+    state: &AppState,
+    now_ms: i64,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let config = match gemini_summary::GeminiSummaryConfig::from_env() {
+        Ok(config) => config,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "status": "failed",
+                    "reason": "invalid_gemini_config",
+                    "generated_now": false,
+                    "error": error,
+                })),
+            );
+        }
+    };
+
+    let client = reqwest::Client::new();
+    let state_for_prompt = gemini_summary::demo_summary_state(now_ms);
+    let prompt = gemini_summary::build_summary_prompt(&state_for_prompt, 1);
+    let summary = match gemini_summary::request_gemini_summary(&client, &config, &prompt).await {
+        Ok(summary) => summary,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "status": "failed",
+                    "reason": "gemini_request_failed",
+                    "generated_now": false,
+                    "error": error.to_string(),
+                })),
+            );
+        }
+    };
+
+    let bucket_seconds = (config.throttle.summary_interval_minutes * 60) as i64;
+    let record = gemini_summary::summary_record(
+        now_ms - (now_ms % (bucket_seconds * 1_000)),
+        bucket_seconds,
+        &config.model,
+        &config.thinking_level,
+        &summary,
+        Vec::new(),
+        Vec::new(),
+        serde_json::json!({ "manual": true, "estimated": true }),
+    );
+    let fallback_path = PathBuf::from(
+        std::env::var("GEMINI_SUMMARY_NDJSON_PATH")
+            .unwrap_or_else(|_| "data/agent-summaries.ndjson".to_string()),
+    );
+    let store = agent_tool_mongo_store(state).await;
+    if let Err(error) =
+        gemini_summary::persist_agent_summary_or_fallback(store.as_ref(), &record, &fallback_path)
+            .await
+    {
+        tracing::warn!(?error, "manual Gemini summary persistence failed");
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "generated",
+            "source": "gemini",
+            "generated_now": true,
+            "cooldown_seconds": config.throttle.manual_cooldown_seconds,
+            "summary": record,
+        })),
+    )
+}
+
 async fn agent_tool_mongo_store(state: &AppState) -> Option<mongo_store::MongoStore> {
     if !state.agent_tool_mongodb_enabled {
         return None;
@@ -3338,6 +3808,13 @@ async fn agent_tool_mongo_store(state: &AppState) -> Option<mongo_store::MongoSt
 
 fn bounded_limit(limit: Option<i64>, default: i64, max: i64) -> i64 {
     limit.unwrap_or(default).clamp(1, max)
+}
+
+fn unix_timestamp_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
 }
 
 fn sample_agent_regime(slug: Option<&str>) -> serde_json::Value {
@@ -3454,6 +3931,7 @@ fn replay_ablation(
     request: &ReplayValidationRequest,
     labels: &[ShiftLabel],
 ) -> Vec<AblationMetric> {
+    let feature_windows = replay_feature_windows(request);
     let (Some(weights), Some(thresholds), Some(horizon_ms)) = (
         request.score_weights,
         request.score_thresholds,
@@ -3462,12 +3940,12 @@ fn replay_ablation(
         return Vec::new();
     };
 
-    if request.feature_windows.is_empty() {
+    if feature_windows.is_empty() {
         return Vec::new();
     }
 
     ablation_report_from_feature_windows(
-        &request.feature_windows,
+        &feature_windows,
         labels,
         &weights,
         &thresholds,
@@ -3478,10 +3956,28 @@ fn replay_ablation(
 
 fn replay_market_slug(request: &ReplayValidationRequest) -> &str {
     request
-        .feature_windows
+        .fair_probability_feature_windows
         .first()
         .map(|window| window.slug.as_str())
+        .or_else(|| {
+            request
+                .feature_windows
+                .first()
+                .map(|window| window.slug.as_str())
+        })
         .unwrap_or("replay")
+}
+
+fn replay_feature_windows(request: &ReplayValidationRequest) -> Vec<FeatureWindowRecord> {
+    if !request.fair_probability_feature_windows.is_empty() {
+        return request
+            .fair_probability_feature_windows
+            .iter()
+            .map(build_feature_window_from_fair_probability_record)
+            .collect();
+    }
+
+    request.feature_windows.clone()
 }
 
 fn replay_alerts(
@@ -3491,7 +3987,8 @@ fn replay_alerts(
         return Ok(request.alerts.clone());
     }
 
-    if request.feature_windows.is_empty() {
+    let feature_windows = replay_feature_windows(request);
+    if feature_windows.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -3518,7 +4015,7 @@ fn replay_alerts(
     };
 
     Ok(generate_alerts_from_feature_windows(
-        &request.feature_windows,
+        &feature_windows,
         &weights,
         &thresholds,
         horizon_ms,

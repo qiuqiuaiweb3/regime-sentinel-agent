@@ -21,6 +21,7 @@
     fallbackDashboardSnapshot,
     fetchDashboardSnapshot,
     normalizeDashboardSnapshot,
+    requestManualExplain,
     snapshotToDashboardView,
     type DashboardSnapshot
   } from '$lib/dashboard';
@@ -132,6 +133,18 @@
     mode = 'replay';
     runState = 'replayed';
     void refreshDashboard();
+  }
+
+  async function explainNow() {
+    runState = 'explaining';
+    try {
+      await requestManualExplain(fetch);
+      runState = 'explained';
+      await refreshDashboard();
+    } catch (error) {
+      const payload = (error as Error & { payload?: { status?: string } }).payload;
+      runState = payload?.status ?? 'explain-error';
+    }
   }
 </script>
 
@@ -318,6 +331,16 @@
           {dashboardView.geminiSummary}
         </p>
         <p class="mt-3 text-xs text-slate-500">Generated {dashboardView.geminiGeneratedAt}</p>
+        <button
+          class="mt-4 inline-flex h-9 items-center gap-2 rounded-md border border-slate-300 bg-white px-3 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+          type="button"
+          disabled={!geminiEnabled || runState === 'explaining'}
+          on:click={explainNow}
+          aria-label="Request Gemini explanation"
+        >
+          <Sparkles size={16} />
+          Explain now
+        </button>
       </section>
 
       <section class="rounded-md border border-slate-200 bg-white p-4">

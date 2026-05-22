@@ -16,7 +16,14 @@ Current implementation status:
 - Rust workspace with `regime-core`, `regime-service`, and `regime-replay`.
 - Google Cloud defaults target `asia-northeast1`.
 - MongoDB and Gemini configuration are provided through environment variables.
+- MongoDB MCP read-only integration is documented in `docs/mongodb-mcp.md`, with
+  a checked-in client config template under `mcp/`.
 - Replay validation can consume prebuilt alerts or generate alerts from feature windows.
+- Strict replay/API validation can also consume `fair_probability_feature_windows`,
+  where `p_fair` is computed from reference price, strike, time remaining,
+  realized volatility, and feed lag instead of accepting caller-provided `p_fair`.
+- Generated alerts use slug-isolated previous-window tracking plus default
+  onset-bucket deduplication and cooldown.
 - MongoDB collection/index bootstrap is available through an explicit CLI.
 - MongoDB document writers exist for market ticks, feature windows, regime states, alerts,
   agent summaries, and backtest runs.
@@ -77,6 +84,8 @@ Required later for live/cloud runs:
 - `GEMINI_LOCATION`
 - `GEMINI_SUMMARY_INTERVAL_MINUTES`
 - `GEMINI_MAX_CALLS_PER_HOUR`
+- `GEMINI_MANUAL_COOLDOWN_SECONDS`
+- `MDB_MCP_CONNECTION_STRING`
 
 Gemini is intentionally disabled by default. The default provider is Vertex AI.
 For a local one-off summary, set:
@@ -89,6 +98,7 @@ GEMINI_MODEL=gemini-3-flash-preview
 GEMINI_ACCESS_TOKEN="$(gcloud auth print-access-token)"
 GEMINI_SUMMARY_INTERVAL_MINUTES=30
 GEMINI_MAX_CALLS_PER_HOUR=2
+GEMINI_MANUAL_COOLDOWN_SECONDS=300
 cargo run -p regime-service --bin gemini_summary_once
 ```
 
@@ -127,7 +137,32 @@ Useful local endpoints:
 - `http://127.0.0.1:8080/api/agent/recent-alerts`
 - `http://127.0.0.1:8080/api/agent/backtest-metrics`
 - `http://127.0.0.1:8080/api/agent/market-summary`
+- `http://127.0.0.1:8080/api/agent/explain-now`
 - `http://127.0.0.1:8080/api/openapi.json`
+
+## MongoDB MCP
+
+The partner MCP integration uses the official MongoDB MCP Server in read-only
+mode. The checked-in template is:
+
+```text
+mcp/mongodb.readonly.example.json
+```
+
+Create an ignored local copy for MCP-capable clients:
+
+```bash
+cp mcp/mongodb.readonly.example.json mcp/mongodb.local.json
+```
+
+Then replace the placeholder connection string or run the server directly with:
+
+```bash
+MDB_MCP_CONNECTION_STRING="${MONGODB_URI}" \
+  npx -y mongodb-mcp-server@1.11.0 --readOnly
+```
+
+See `docs/mongodb-mcp.md` for boundaries and verification evidence.
 
 ## Replay Demo Artifacts
 
@@ -301,6 +336,11 @@ The project is accepted only when these gates are backed by artifacts:
 - Hosted web app is reachable.
 - MongoDB Atlas collections are written and queryable.
 - Agent Builder is configured with the hosted OpenAPI tool and playbook.
+- MongoDB MCP read-only integration template is present and verified locally.
+- Strict fair-probability replay/API input path is covered by tests; raw
+  `feature_windows[].p_fair` is kept only for legacy replay fixtures.
+- Generated alerts are deduplicated by market/direction/onset bucket and use
+  cooldown by default on the main alert-generation path.
 - Gemini is actually used for summaries.
 - Replay mode can reproduce a fixed high-volatility window.
 - Strict replay acceptance covers 1s, 5s, and 30s horizons with early alerts and

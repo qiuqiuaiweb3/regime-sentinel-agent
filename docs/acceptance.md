@@ -5,7 +5,21 @@ hosted Google Cloud infrastructure.
 
 ## Implemented And Verified
 
-- Rust hot-path core: alert scoring, shift labels, feature windows, replay validation.
+- Rust hot-path core: alert scoring, shift labels, feature windows, replay validation,
+  fair probability calculation, and alert deduplication.
+- Strict fair-probability replay/API path:
+  - `fair_probability_feature_windows` is accepted by both `regime-replay` and
+    `POST /api/replay/validate`.
+  - `p_fair` is computed from `current_price`, `strike_price`,
+    `time_remaining_ms`, `realized_volatility`, and `feed_lag_ms`.
+  - Raw `feature_windows[].p_fair` remains as a legacy replay compatibility path,
+    not the strict acceptance path.
+  - Stale or invalid fair-probability inputs downgrade confidence and apply the
+    stale-data penalty when either the previous or current window is degraded.
+- Alert generation through `generate_alerts_from_feature_windows` now uses
+  slug-isolated previous-window tracking plus onset-bucket deduplication and
+  cooldown by default, so replay/API/latency/ablation callers do not score
+  adjacent windows across different markets.
 - MongoDB schema/index specs and Atlas bootstrap CLI.
 - MongoDB document writers for `market_ticks`, `feature_windows`, `regime_states`,
   `alerts`, `agent_summaries`, and `backtest_runs`.
@@ -20,15 +34,23 @@ hosted Google Cloud infrastructure.
   - `POST /api/agent/similar-windows`
   - `GET /api/agent/backtest-metrics`
   - `GET /api/agent/market-summary`
+  - `POST /api/agent/explain-now`
   - `GET /api/openapi.json`
 - SvelteKit dashboard served by Axum static fallback, with live/replay mode,
   TradingView Lightweight Charts, similar-history context, validation metrics,
-  and Gemini summary coverage.
+  Gemini summary coverage, and a cooldown-gated `Explain now` action.
 - Polymarket CLOB market collector core, Coinbase BTC reference collector core,
   stale-data downgrade, and NDJSON fallback.
 - Gemini summary request builder/parser/scheduler, disabled by default and gated by
   `GEMINI_ENABLED=true`, with Vertex AI as the default provider and Developer API key
   fallback.
+- Manual Gemini explain is gated by `GEMINI_MANUAL_COOLDOWN_SECONDS`
+  / `MANUAL_EXPLAIN_COOLDOWN_SECONDS` and a shared `GEMINI_MAX_CALLS_PER_HOUR`
+  budget across automatic summaries and manual requests.
+- MongoDB MCP integration is documented in `docs/mongodb-mcp.md` with a read-only
+  official server template at `mcp/mongodb.readonly.example.json`.
+- Local MCP package resolution was verified with
+  `npx -y mongodb-mcp-server@1.11.0 --version`, which returned `1.11.0`.
 - Real Vertex AI Gemini summary was observed on 2026-05-23 JST with
   `gemini-3-flash-preview`; `gemini_summary_once` returned text and persisted it to
   MongoDB `agent_summaries`.
@@ -43,6 +65,9 @@ hosted Google Cloud infrastructure.
   - `demo/reports/backtest-run.sample.json`
 - Current replay sample has one early alert at `750ms` for a shift onset at `1000ms`,
   with `250ms` lead time.
+- Replay/API tests cover fair-probability input based alert generation, default
+  dedup/cooldown, interleaved-market isolation, and stale fair-probability
+  confidence downgrade.
 - Strict deterministic replay acceptance artifacts:
   - `demo/replay/acceptance-lead-time-window.json`
   - `demo/reports/acceptance-lead-time-report.json`
@@ -81,7 +106,8 @@ hosted Google Cloud infrastructure.
   - `/health` returned `{"status":"ok","service":"regime-service"}`.
   - `/api/openapi.json` returned OpenAPI `3.0.3`, the hosted Cloud Run server URL,
     a JSON request schema for `POST /api/replay/validate`, and Agent Builder
-    operations including `getCurrentRegime` and `findSimilarWindows`.
+    operations including `getCurrentRegime`, `findSimilarWindows`, and
+    `explainNow`.
   - Hosted Agent tool endpoints returned HTTP `200` with sample fallback when
     MongoDB was unavailable from Cloud Run:
     - `GET /api/agent/current-regime`
@@ -135,6 +161,8 @@ npm test -- --run
 npm run check
 npm run build
 npm audit --omit=dev
+npx -y mongodb-mcp-server@1.11.0 --version
+node -e "JSON.parse(require('fs').readFileSync('mcp/mongodb.readonly.example.json','utf8'))"
 cargo run -q -p regime-replay --bin regime-replay -- \
   --input demo/replay/high-volatility-btc-window.json | jq .
 cargo run -q -p regime-replay --bin regime-replay -- \

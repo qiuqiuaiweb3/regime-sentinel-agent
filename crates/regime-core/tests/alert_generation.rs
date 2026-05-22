@@ -1,7 +1,8 @@
 use regime_core::{
-    AlertState, FeatureWindowMetrics, ScoreThresholds, ScoreWeights, ShiftDirection, ShiftLabel,
-    ablation_report_from_feature_windows, build_feature_window, feature_snapshot_from_windows,
-    generate_alerts_from_feature_windows,
+    AlertDedupPolicy, AlertState, FeatureWindowMetrics, ScoreThresholds, ScoreWeights,
+    ShiftDirection, ShiftLabel, ablation_report_from_feature_windows, build_feature_window,
+    feature_snapshot_from_windows, generate_alerts_from_feature_windows,
+    generate_deduped_alerts_from_feature_windows,
 };
 
 fn weights() -> ScoreWeights {
@@ -97,6 +98,327 @@ fn generate_alerts_from_feature_windows_emits_non_equilibrium_states() {
     assert_eq!(alerts[0].timestamp_ms, 2_000);
     assert_eq!(alerts[0].state, AlertState::EarlyRisk);
     assert_eq!(alerts[0].horizon_ms, 1_000);
+}
+
+#[test]
+fn generate_alerts_from_feature_windows_does_not_score_across_interleaved_markets() {
+    let windows = vec![
+        build_feature_window(
+            "market-a",
+            FeatureWindowMetrics {
+                window_ts_ms: 0,
+                window_ms: 1_000,
+                p_mid: 0.90,
+                p_fair: 0.50,
+                ofi_1s: 0.0,
+                depth_imbalance: 0.0,
+                spread: 0.02,
+                volume_acceleration: 0.0,
+            },
+        ),
+        build_feature_window(
+            "market-b",
+            FeatureWindowMetrics {
+                window_ts_ms: 100,
+                window_ms: 1_000,
+                p_mid: 0.10,
+                p_fair: 0.50,
+                ofi_1s: 0.0,
+                depth_imbalance: 0.0,
+                spread: 0.02,
+                volume_acceleration: 0.0,
+            },
+        ),
+        build_feature_window(
+            "market-b",
+            FeatureWindowMetrics {
+                window_ts_ms: 1_100,
+                window_ms: 1_000,
+                p_mid: 0.11,
+                p_fair: 0.50,
+                ofi_1s: 0.0,
+                depth_imbalance: 0.0,
+                spread: 0.02,
+                volume_acceleration: 0.0,
+            },
+        ),
+    ];
+    let thresholds = ScoreThresholds {
+        watch: 0.5,
+        early_risk: 1.0,
+        shift_detected_move: 0.10,
+    };
+
+    let alerts = generate_alerts_from_feature_windows(&windows, &weights(), &thresholds, 1_000);
+
+    assert!(alerts.is_empty());
+}
+
+#[test]
+fn generate_alerts_from_feature_windows_applies_default_dedup_cooldown() {
+    let windows = vec![
+        build_feature_window(
+            "btc-updown-5m",
+            FeatureWindowMetrics {
+                window_ts_ms: 0,
+                window_ms: 1_000,
+                p_mid: 0.50,
+                p_fair: 0.49,
+                ofi_1s: 0.0,
+                depth_imbalance: 0.0,
+                spread: 0.02,
+                volume_acceleration: 1.0,
+            },
+        ),
+        build_feature_window(
+            "btc-updown-5m",
+            FeatureWindowMetrics {
+                window_ts_ms: 1_000,
+                window_ms: 1_000,
+                p_mid: 0.54,
+                p_fair: 0.49,
+                ofi_1s: 0.42,
+                depth_imbalance: 0.31,
+                spread: 0.03,
+                volume_acceleration: 2.1,
+            },
+        ),
+        build_feature_window(
+            "btc-updown-5m",
+            FeatureWindowMetrics {
+                window_ts_ms: 2_000,
+                window_ms: 1_000,
+                p_mid: 0.58,
+                p_fair: 0.49,
+                ofi_1s: 0.43,
+                depth_imbalance: 0.32,
+                spread: 0.03,
+                volume_acceleration: 2.2,
+            },
+        ),
+    ];
+
+    let alerts = generate_alerts_from_feature_windows(&windows, &weights(), &thresholds(), 5_000);
+
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].timestamp_ms, 1_000);
+}
+
+#[test]
+fn generate_deduped_alerts_applies_onset_bucket_and_cooldown_per_market_direction() {
+    let windows = vec![
+        build_feature_window(
+            "btc-updown-5m-a",
+            FeatureWindowMetrics {
+                window_ts_ms: 0,
+                window_ms: 1_000,
+                p_mid: 0.50,
+                p_fair: 0.49,
+                ofi_1s: 0.0,
+                depth_imbalance: 0.0,
+                spread: 0.02,
+                volume_acceleration: 1.0,
+            },
+        ),
+        build_feature_window(
+            "btc-updown-5m-a",
+            FeatureWindowMetrics {
+                window_ts_ms: 1_000,
+                window_ms: 1_000,
+                p_mid: 0.54,
+                p_fair: 0.49,
+                ofi_1s: 0.42,
+                depth_imbalance: 0.31,
+                spread: 0.03,
+                volume_acceleration: 2.1,
+            },
+        ),
+        build_feature_window(
+            "btc-updown-5m-a",
+            FeatureWindowMetrics {
+                window_ts_ms: 2_000,
+                window_ms: 1_000,
+                p_mid: 0.58,
+                p_fair: 0.49,
+                ofi_1s: 0.43,
+                depth_imbalance: 0.32,
+                spread: 0.03,
+                volume_acceleration: 2.2,
+            },
+        ),
+        build_feature_window(
+            "btc-updown-5m-a",
+            FeatureWindowMetrics {
+                window_ts_ms: 7_000,
+                window_ms: 1_000,
+                p_mid: 0.62,
+                p_fair: 0.49,
+                ofi_1s: 0.44,
+                depth_imbalance: 0.33,
+                spread: 0.03,
+                volume_acceleration: 2.3,
+            },
+        ),
+    ];
+    let policy = AlertDedupPolicy {
+        onset_window_ms: 5_000,
+        cooldown_ms: 5_000,
+    };
+
+    let alerts = generate_deduped_alerts_from_feature_windows(
+        &windows,
+        &weights(),
+        &thresholds(),
+        1_000,
+        &policy,
+    );
+
+    assert_eq!(alerts.len(), 2);
+    assert_eq!(alerts[0].timestamp_ms, 1_000);
+    assert_eq!(alerts[1].timestamp_ms, 7_000);
+    assert_eq!(alerts[0].direction, "UP");
+    assert_eq!(alerts[0].dedup_key, "btc-updown-5m-a:UP:0");
+    assert_eq!(alerts[1].dedup_key, "btc-updown-5m-a:UP:5000");
+}
+
+#[test]
+fn generate_deduped_alerts_keeps_separate_markets_and_directions() {
+    let windows = vec![
+        build_feature_window(
+            "btc-updown-5m-a",
+            FeatureWindowMetrics {
+                window_ts_ms: 0,
+                window_ms: 1_000,
+                p_mid: 0.50,
+                p_fair: 0.50,
+                ofi_1s: 0.0,
+                depth_imbalance: 0.0,
+                spread: 0.02,
+                volume_acceleration: 1.0,
+            },
+        ),
+        build_feature_window(
+            "btc-updown-5m-a",
+            FeatureWindowMetrics {
+                window_ts_ms: 1_000,
+                window_ms: 1_000,
+                p_mid: 0.45,
+                p_fair: 0.50,
+                ofi_1s: -0.42,
+                depth_imbalance: -0.31,
+                spread: 0.03,
+                volume_acceleration: 2.1,
+            },
+        ),
+        build_feature_window(
+            "btc-updown-5m-b",
+            FeatureWindowMetrics {
+                window_ts_ms: 1_500,
+                window_ms: 1_000,
+                p_mid: 0.50,
+                p_fair: 0.50,
+                ofi_1s: 0.0,
+                depth_imbalance: 0.0,
+                spread: 0.02,
+                volume_acceleration: 1.0,
+            },
+        ),
+        build_feature_window(
+            "btc-updown-5m-b",
+            FeatureWindowMetrics {
+                window_ts_ms: 2_000,
+                window_ms: 1_000,
+                p_mid: 0.55,
+                p_fair: 0.50,
+                ofi_1s: 0.42,
+                depth_imbalance: 0.31,
+                spread: 0.03,
+                volume_acceleration: 2.1,
+            },
+        ),
+    ];
+    let policy = AlertDedupPolicy {
+        onset_window_ms: 5_000,
+        cooldown_ms: 5_000,
+    };
+
+    let alerts = generate_deduped_alerts_from_feature_windows(
+        &windows,
+        &weights(),
+        &thresholds(),
+        1_000,
+        &policy,
+    );
+
+    assert_eq!(alerts.len(), 2);
+    assert_eq!(alerts[0].direction, "DOWN");
+    assert_eq!(alerts[1].direction, "UP");
+    assert!(alerts[0].dedup_key.starts_with("btc-updown-5m-a:DOWN"));
+    assert!(alerts[1].dedup_key.starts_with("btc-updown-5m-b:UP"));
+}
+
+#[test]
+fn generate_deduped_alerts_does_not_score_across_interleaved_markets() {
+    let windows = vec![
+        build_feature_window(
+            "market-a",
+            FeatureWindowMetrics {
+                window_ts_ms: 0,
+                window_ms: 1_000,
+                p_mid: 0.90,
+                p_fair: 0.50,
+                ofi_1s: 0.0,
+                depth_imbalance: 0.0,
+                spread: 0.02,
+                volume_acceleration: 0.0,
+            },
+        ),
+        build_feature_window(
+            "market-b",
+            FeatureWindowMetrics {
+                window_ts_ms: 100,
+                window_ms: 1_000,
+                p_mid: 0.10,
+                p_fair: 0.50,
+                ofi_1s: 0.0,
+                depth_imbalance: 0.0,
+                spread: 0.02,
+                volume_acceleration: 0.0,
+            },
+        ),
+        build_feature_window(
+            "market-b",
+            FeatureWindowMetrics {
+                window_ts_ms: 1_100,
+                window_ms: 1_000,
+                p_mid: 0.11,
+                p_fair: 0.50,
+                ofi_1s: 0.0,
+                depth_imbalance: 0.0,
+                spread: 0.02,
+                volume_acceleration: 0.0,
+            },
+        ),
+    ];
+    let policy = AlertDedupPolicy {
+        onset_window_ms: 5_000,
+        cooldown_ms: 5_000,
+    };
+    let thresholds = ScoreThresholds {
+        watch: 0.5,
+        early_risk: 1.0,
+        shift_detected_move: 0.10,
+    };
+
+    let alerts = generate_deduped_alerts_from_feature_windows(
+        &windows,
+        &weights(),
+        &thresholds,
+        1_000,
+        &policy,
+    );
+
+    assert!(alerts.is_empty());
 }
 
 #[test]

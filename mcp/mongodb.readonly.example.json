@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "MongoDB": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mongodb-mcp-server@1.11.0",
+        "--readOnly"
+      ],
+      "env": {
+        "MDB_MCP_CONNECTION_STRING": "mongodb+srv://<username>:<password>@<cluster-host>/<database>?appName=poly-market-analysis"
+      }
+    }
+  }
+}

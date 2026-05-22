@@ -2,6 +2,7 @@ use anyhow::Context;
 use mongodb::Client;
 use regime_service::{
     gemini_summary::{GeminiSummaryConfig, run_gemini_summary_scheduler},
+    gemini_throttle::GeminiCallBudget,
     live_collector::{LiveCollectorConfig, run_live_collector, run_reference_price_collector},
     mongo_store::MongoStore,
 };
@@ -18,6 +19,7 @@ async fn main() -> anyhow::Result<()> {
     let addr: SocketAddr = format!("{host}:{port}").parse()?;
     let collector_config = LiveCollectorConfig::from_env().map_err(anyhow::Error::msg)?;
     let gemini_config = GeminiSummaryConfig::from_env().map_err(anyhow::Error::msg)?;
+    let gemini_call_budget = GeminiCallBudget::new();
 
     if collector_config.enabled {
         let collector_store = mongo_store_from_env("live collector").await?;
@@ -47,9 +49,15 @@ async fn main() -> anyhow::Result<()> {
             env::var("GEMINI_SUMMARY_NDJSON_PATH")
                 .unwrap_or_else(|_| "data/agent-summaries.ndjson".to_string()),
         );
+        let scheduler_gemini_call_budget = gemini_call_budget.clone();
         tokio::spawn(async move {
-            if let Err(error) =
-                run_gemini_summary_scheduler(gemini_config, gemini_store, fallback_path).await
+            if let Err(error) = run_gemini_summary_scheduler(
+                gemini_config,
+                gemini_store,
+                fallback_path,
+                scheduler_gemini_call_budget,
+            )
+            .await
             {
                 tracing::error!(?error, "Gemini summary scheduler stopped");
             }
@@ -59,7 +67,11 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
     tracing::info!(%addr, "starting regime-service");
-    axum::serve(listener, regime_service::build_router()).await?;
+    axum::serve(
+        listener,
+        regime_service::build_router_with_gemini_call_budget(gemini_call_budget),
+    )
+    .await?;
     Ok(())
 }
 

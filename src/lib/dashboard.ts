@@ -50,6 +50,15 @@ export type DashboardValidation = {
   horizons: DashboardValidationHorizon[];
 };
 
+export type ManualExplainResponse = {
+  status: string;
+  generated_now: boolean;
+  cooldown_seconds?: number;
+  retry_after_seconds?: number;
+  reason?: string;
+  summary?: unknown;
+};
+
 export type DashboardSnapshot = {
   mode: 'live' | 'replay';
   regime: DashboardRegime;
@@ -178,6 +187,23 @@ export async function fetchDashboardSnapshot(
     throw new Error(`dashboard snapshot request failed: ${response.status}`);
   }
   return normalizeDashboardSnapshot((await response.json()) as PartialDashboardSnapshot);
+}
+
+export async function requestManualExplain(
+  fetcher: typeof fetch = fetch
+): Promise<ManualExplainResponse> {
+  const response = await fetcher('/api/agent/explain-now', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: '{}'
+  });
+  const payload = (await response.json()) as ManualExplainResponse;
+  if (!response.ok) {
+    throw Object.assign(new Error(`manual explain request failed: ${response.status}`), {
+      payload
+    });
+  }
+  return payload;
 }
 
 export function normalizeDashboardSnapshot(snapshot: PartialDashboardSnapshot): DashboardSnapshot {

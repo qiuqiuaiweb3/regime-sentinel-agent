@@ -164,6 +164,88 @@ fn replay_cli_generates_alerts_from_feature_windows_when_alerts_are_absent() {
 }
 
 #[test]
+fn replay_cli_generates_alerts_from_fair_probability_inputs() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let input_path = temp_dir.path().join("replay.json");
+    fs::write(
+        &input_path,
+        r#"{
+  "price_points": [
+    {"timestamp_ms": 0, "p_mid": 0.50},
+    {"timestamp_ms": 1000, "p_mid": 0.62},
+    {"timestamp_ms": 4000, "p_mid": 0.61}
+  ],
+  "fair_probability_feature_windows": [
+    {
+      "slug": "btc-updown-5m",
+      "window_ts_ms": 0,
+      "window_ms": 1000,
+      "p_mid": 0.50,
+      "fair_probability": {
+        "current_price": 100000.0,
+        "strike_price": 100000.0,
+        "time_remaining_ms": 60000,
+        "realized_volatility": 0.40,
+        "feed_lag_ms": 100
+      },
+      "ofi_1s": 0.01,
+      "depth_imbalance": 0.01,
+      "spread": 0.02,
+      "volume_acceleration": 0.01
+    },
+    {
+      "slug": "btc-updown-5m",
+      "window_ts_ms": 750,
+      "window_ms": 1000,
+      "p_mid": 0.58,
+      "fair_probability": {
+        "current_price": 100000.0,
+        "strike_price": 100000.0,
+        "time_remaining_ms": 59250,
+        "realized_volatility": 0.40,
+        "feed_lag_ms": 100
+      },
+      "ofi_1s": 0.42,
+      "depth_imbalance": 0.31,
+      "spread": 0.03,
+      "volume_acceleration": 2.1
+    }
+  ],
+  "score_weights": {
+    "fair_gap_velocity": 4.0,
+    "depth_imbalance": 1.0,
+    "ofi_1s": 1.0,
+    "volume_acceleration": 0.5,
+    "stale_data_penalty": 1.0
+  },
+  "score_thresholds": {
+    "watch": 0.5,
+    "early_risk": 1.0,
+    "shift_detected_move": 0.10
+  },
+  "alert_horizon_ms": 1000,
+  "label_config": {
+    "horizons_ms": [1000],
+    "min_move": 0.10,
+    "persist_ms": 3000
+  },
+  "synchronous_tolerance_ms": 100
+}"#,
+    )
+    .expect("write replay input");
+
+    Command::cargo_bin("regime-replay")
+        .expect("regime-replay binary")
+        .arg("--input")
+        .arg(input_path)
+        .assert()
+        .success()
+        .stdout(contains(r#""timestamp_ms":750"#))
+        .stdout(contains(r#""early":1"#))
+        .stdout(contains(r#""lead_time_ms":250"#));
+}
+
+#[test]
 fn replay_cli_acceptance_fixture_reports_1s_5s_30s_lead_time_evidence() {
     let input_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../demo/replay/acceptance-lead-time-window.json");

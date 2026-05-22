@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -27,6 +27,51 @@ pub struct FeatureWindowMetrics {
     pub volume_acceleration: f64,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Serialize)]
+pub struct FairProbabilityInput {
+    pub current_price: f64,
+    /// Market start price / strike price for the Up/Down market.
+    pub strike_price: f64,
+    pub time_remaining_ms: i64,
+    pub realized_volatility: f64,
+    #[serde(default)]
+    pub feed_lag_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FairProbabilityDegradeReason {
+    InvalidPriceInput,
+    InvalidVolatilityInput,
+    ReferenceFeedStale,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Serialize)]
+pub struct FairProbabilityResult {
+    pub p_fair: f64,
+    pub degraded: bool,
+    pub degrade_reason: Option<FairProbabilityDegradeReason>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Serialize)]
+pub struct FairProbabilityFeatureWindowMetrics {
+    pub window_ts_ms: i64,
+    pub window_ms: i64,
+    pub p_mid: f64,
+    pub fair_probability: FairProbabilityInput,
+    pub ofi_1s: f64,
+    pub depth_imbalance: f64,
+    pub spread: f64,
+    pub volume_acceleration: f64,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
+pub struct FairProbabilityFeatureWindowRecord {
+    pub slug: String,
+    #[serde(flatten)]
+    pub metrics: FairProbabilityFeatureWindowMetrics,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 pub struct FeatureWindowRecord {
     pub slug: String,
@@ -40,6 +85,10 @@ pub struct FeatureWindowRecord {
     pub spread: f64,
     pub volume_acceleration: f64,
     pub feature_vector: [f64; 5],
+    #[serde(default)]
+    pub fair_probability_degraded: bool,
+    #[serde(default)]
+    pub fair_probability_degrade_reason: Option<FairProbabilityDegradeReason>,
 }
 
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
@@ -176,6 +225,24 @@ pub struct AlertRecord {
     pub confidence: AlertConfidence,
     pub horizon_ms: i64,
     pub score: f64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AlertDedupPolicy {
+    pub onset_window_ms: i64,
+    pub cooldown_ms: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
+pub struct DedupedAlertRecord {
+    pub timestamp_ms: i64,
+    pub state: AlertState,
+    pub confidence: AlertConfidence,
+    pub horizon_ms: i64,
+    pub score: f64,
+    pub slug: String,
+    pub direction: String,
+    pub dedup_key: String,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
@@ -348,6 +415,72 @@ pub fn build_feature_window(
             metrics.spread,
             metrics.volume_acceleration,
         ],
+        fair_probability_degraded: false,
+        fair_probability_degrade_reason: None,
+    }
+}
+
+pub fn build_feature_window_from_fair_probability(
+    slug: impl Into<String>,
+    metrics: FairProbabilityFeatureWindowMetrics,
+) -> FeatureWindowRecord {
+    let fair_probability = calculate_fair_probability(metrics.fair_probability);
+
+    let mut window = build_feature_window(
+        slug,
+        FeatureWindowMetrics {
+            window_ts_ms: metrics.window_ts_ms,
+            window_ms: metrics.window_ms,
+            p_mid: metrics.p_mid,
+            p_fair: fair_probability.p_fair,
+            ofi_1s: metrics.ofi_1s,
+            depth_imbalance: metrics.depth_imbalance,
+            spread: metrics.spread,
+            volume_acceleration: metrics.volume_acceleration,
+        },
+    );
+    window.fair_probability_degraded = fair_probability.degraded;
+    window.fair_probability_degrade_reason = fair_probability.degrade_reason;
+    window
+}
+
+pub fn build_feature_window_from_fair_probability_record(
+    record: &FairProbabilityFeatureWindowRecord,
+) -> FeatureWindowRecord {
+    build_feature_window_from_fair_probability(record.slug.clone(), record.metrics)
+}
+
+pub fn calculate_fair_probability(input: FairProbabilityInput) -> FairProbabilityResult {
+    if !input.current_price.is_finite()
+        || !input.strike_price.is_finite()
+        || input.current_price <= 0.0
+        || input.strike_price <= 0.0
+    {
+        return FairProbabilityResult {
+            p_fair: 0.5,
+            degraded: true,
+            degrade_reason: Some(FairProbabilityDegradeReason::InvalidPriceInput),
+        };
+    }
+    if !input.realized_volatility.is_finite() || input.realized_volatility < 0.0 {
+        return FairProbabilityResult {
+            p_fair: 0.5,
+            degraded: true,
+            degrade_reason: Some(FairProbabilityDegradeReason::InvalidVolatilityInput),
+        };
+    }
+
+    let stale_reference = input.feed_lag_ms > FAIR_PROBABILITY_STALE_FEED_LAG_MS;
+    let p_fair = if input.time_remaining_ms <= 0 || input.realized_volatility <= 0.0 {
+        deterministic_finish_probability(input.current_price, input.strike_price)
+    } else {
+        lognormal_finish_probability(input)
+    };
+
+    FairProbabilityResult {
+        p_fair,
+        degraded: stale_reference,
+        degrade_reason: stale_reference.then_some(FairProbabilityDegradeReason::ReferenceFeedStale),
     }
 }
 
@@ -355,15 +488,18 @@ pub fn feature_snapshot_from_windows(
     previous: &FeatureWindowRecord,
     current: &FeatureWindowRecord,
 ) -> FeatureSnapshot {
+    let fair_probability_degraded =
+        previous.fair_probability_degraded || current.fair_probability_degraded;
+
     FeatureSnapshot {
         fair_gap_velocity: current.fair_gap - previous.fair_gap,
         depth_imbalance: current.depth_imbalance,
         ofi_1s: current.ofi_1s,
         volume_acceleration: current.volume_acceleration,
-        stale_data_penalty: 0.0,
+        stale_data_penalty: if fair_probability_degraded { 1.0 } else { 0.0 },
         p_mid_delta: current.p_mid - previous.p_mid,
         p_fair_delta: current.p_fair - previous.p_fair,
-        liquidity_reliable: true,
+        liquidity_reliable: !fair_probability_degraded,
     }
 }
 
@@ -373,26 +509,78 @@ pub fn generate_alerts_from_feature_windows(
     thresholds: &ScoreThresholds,
     horizon_ms: i64,
 ) -> Vec<AlertRecord> {
-    windows
-        .windows(2)
-        .filter_map(|pair| {
-            let current = &pair[1];
-            let snapshot = feature_snapshot_from_windows(&pair[0], current);
-            let decision = score_alert(&snapshot, weights, thresholds);
-
-            if decision.state == AlertState::Equilibrium {
-                return None;
-            }
-
-            Some(AlertRecord {
-                timestamp_ms: current.window_ts_ms,
-                state: decision.state,
-                confidence: decision.confidence,
-                horizon_ms,
-                score: decision.score,
-            })
+    let policy = default_alert_dedup_policy(horizon_ms);
+    generate_deduped_alerts_from_feature_windows(windows, weights, thresholds, horizon_ms, &policy)
+        .into_iter()
+        .map(|alert| AlertRecord {
+            timestamp_ms: alert.timestamp_ms,
+            state: alert.state,
+            confidence: alert.confidence,
+            horizon_ms: alert.horizon_ms,
+            score: alert.score,
         })
         .collect()
+}
+
+pub fn generate_deduped_alerts_from_feature_windows(
+    windows: &[FeatureWindowRecord],
+    weights: &ScoreWeights,
+    thresholds: &ScoreThresholds,
+    horizon_ms: i64,
+    policy: &AlertDedupPolicy,
+) -> Vec<DedupedAlertRecord> {
+    let mut last_alert_by_stream = BTreeMap::<String, i64>::new();
+    let mut previous_window_by_slug = BTreeMap::<String, &FeatureWindowRecord>::new();
+    let mut seen_dedup_keys = BTreeSet::<String>::new();
+    let mut alerts = Vec::new();
+
+    for current in windows {
+        let Some(previous) = previous_window_by_slug.insert(current.slug.clone(), current) else {
+            continue;
+        };
+        let snapshot = feature_snapshot_from_windows(previous, current);
+        let decision = score_alert(&snapshot, weights, thresholds);
+        if decision.state == AlertState::Equilibrium {
+            continue;
+        }
+
+        let direction = alert_direction(current);
+        let base_alert = AlertRecord {
+            timestamp_ms: current.window_ts_ms,
+            state: decision.state,
+            confidence: decision.confidence,
+            horizon_ms,
+            score: decision.score,
+        };
+        let alert = DedupedAlertRecord {
+            timestamp_ms: base_alert.timestamp_ms,
+            state: base_alert.state,
+            confidence: base_alert.confidence,
+            horizon_ms: base_alert.horizon_ms,
+            score: base_alert.score,
+            slug: current.slug.clone(),
+            direction,
+            dedup_key: String::new(),
+        };
+        let dedup_key = alert_dedup_key(&alert, policy.onset_window_ms);
+        let cooldown_key = format!("{}:{}", alert.slug, alert.direction);
+        let allowed_by_cooldown =
+            last_alert_by_stream
+                .get(&cooldown_key)
+                .is_none_or(|last_timestamp_ms| {
+                    alert.timestamp_ms.saturating_sub(*last_timestamp_ms) >= policy.cooldown_ms
+                });
+
+        if !allowed_by_cooldown || !seen_dedup_keys.insert(dedup_key.clone()) {
+            continue;
+        }
+
+        last_alert_by_stream.insert(cooldown_key, alert.timestamp_ms);
+        let alert = DedupedAlertRecord { dedup_key, ..alert };
+        alerts.push(alert);
+    }
+
+    alerts
 }
 
 pub fn ablation_report_from_feature_windows(
@@ -453,6 +641,34 @@ pub fn ablation_report_from_feature_windows(
             }
         })
         .collect()
+}
+
+fn alert_direction(window: &FeatureWindowRecord) -> String {
+    if window.fair_gap.is_sign_negative()
+        || (window.fair_gap == 0.0 && window.ofi_1s.is_sign_negative())
+    {
+        "DOWN".to_string()
+    } else {
+        "UP".to_string()
+    }
+}
+
+fn default_alert_dedup_policy(horizon_ms: i64) -> AlertDedupPolicy {
+    let bucket_ms = horizon_ms.max(1);
+    AlertDedupPolicy {
+        onset_window_ms: bucket_ms,
+        cooldown_ms: bucket_ms,
+    }
+}
+
+fn alert_dedup_key(alert: &DedupedAlertRecord, onset_window_ms: i64) -> String {
+    let bucket_ms = if onset_window_ms > 0 {
+        alert.timestamp_ms - alert.timestamp_ms.rem_euclid(onset_window_ms)
+    } else {
+        alert.timestamp_ms
+    };
+
+    format!("{}:{}:{}", alert.slug, alert.direction, bucket_ms)
 }
 
 pub fn generate_shift_labels(points: &[PricePoint], config: &ShiftLabelConfig) -> Vec<ShiftLabel> {
@@ -666,6 +882,50 @@ pub fn vector_search_specs() -> [VectorSearchSpec; 1] {
         dimensions: 5,
         similarity: "cosine",
     }]
+}
+
+const FAIR_PROBABILITY_STALE_FEED_LAG_MS: i64 = 1_500;
+const MILLIS_PER_YEAR: f64 = 365.0 * 24.0 * 60.0 * 60.0 * 1_000.0;
+
+fn deterministic_finish_probability(current_price: f64, strike_price: f64) -> f64 {
+    if current_price > strike_price {
+        1.0
+    } else if current_price < strike_price {
+        0.0
+    } else {
+        0.5
+    }
+}
+
+fn lognormal_finish_probability(input: FairProbabilityInput) -> f64 {
+    let time_years = input.time_remaining_ms as f64 / MILLIS_PER_YEAR;
+    let vol_sqrt_time = input.realized_volatility * time_years.sqrt();
+
+    if !time_years.is_finite() || !vol_sqrt_time.is_finite() || vol_sqrt_time <= 0.0 {
+        return deterministic_finish_probability(input.current_price, input.strike_price);
+    }
+
+    let log_moneyness = (input.current_price / input.strike_price).ln();
+    let d2 = (log_moneyness - 0.5 * input.realized_volatility.powi(2) * time_years) / vol_sqrt_time;
+
+    normal_cdf(d2).clamp(0.0, 1.0)
+}
+
+fn normal_cdf(value: f64) -> f64 {
+    0.5 * (1.0 + erf(value / 2.0_f64.sqrt()))
+}
+
+fn erf(value: f64) -> f64 {
+    let sign = if value < 0.0 { -1.0 } else { 1.0 };
+    let x = value.abs();
+    let t = 1.0 / (1.0 + 0.327_591_1 * x);
+    let y = 1.0
+        - (((((1.061_405_429 * t - 1.453_152_027) * t + 1.421_413_741) * t - 0.284_496_736) * t
+            + 0.254_829_592)
+            * t
+            * (-x * x).exp());
+
+    sign * y
 }
 
 fn first_point_at_or_after(points: &[PricePoint], timestamp_ms: i64) -> Option<&PricePoint> {

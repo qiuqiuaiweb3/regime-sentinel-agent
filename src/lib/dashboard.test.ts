@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   fetchDashboardSnapshot,
   normalizeDashboardSnapshot,
+  requestManualExplain,
   snapshotToDashboardView,
   type DashboardSnapshot
 } from './dashboard';
@@ -141,5 +142,34 @@ describe('snapshotToDashboardView', () => {
     await fetchDashboardSnapshot(fetcher as typeof fetch, 'replay');
 
     expect(requests).toEqual(['/api/dashboard/snapshot?mode=replay']);
+  });
+
+  it('posts manual explain requests without sending market data', async () => {
+    const requests: Array<{ url: string; init?: RequestInit }> = [];
+    const fetcher = async (url: string, init?: RequestInit) => {
+      requests.push({ url, init });
+      return {
+        ok: true,
+        json: async () => ({
+          status: 'generated',
+          generated_now: true,
+          cooldown_seconds: 300
+        })
+      } as Response;
+    };
+
+    const result = await requestManualExplain(fetcher as typeof fetch);
+
+    expect(result.status).toBe('generated');
+    expect(requests).toEqual([
+      {
+        url: '/api/agent/explain-now',
+        init: {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: '{}'
+        }
+      }
+    ]);
   });
 });
