@@ -120,6 +120,25 @@ pub struct ValidationReport {
     pub summary: ValidationSummary,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+pub enum CollectionKind {
+    MarketTicks,
+    FeatureWindows,
+    RegimeStates,
+    Alerts,
+    AgentSummaries,
+    BacktestRuns,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+pub struct MongoIndexSpec {
+    pub collection: CollectionKind,
+    pub name: &'static str,
+    pub fields: &'static [&'static str],
+    pub unique: bool,
+    pub ttl_seconds: Option<i64>,
+}
+
 pub fn score_alert(
     features: &FeatureSnapshot,
     weights: &ScoreWeights,
@@ -253,6 +272,71 @@ pub fn validate_alerts(
     }
 
     ValidationReport { results, summary }
+}
+
+pub fn mongo_collection_names() -> [&'static str; 6] {
+    [
+        "market_ticks",
+        "feature_windows",
+        "regime_states",
+        "alerts",
+        "agent_summaries",
+        "backtest_runs",
+    ]
+}
+
+pub fn mongo_index_specs() -> [MongoIndexSpec; 7] {
+    [
+        MongoIndexSpec {
+            collection: CollectionKind::MarketTicks,
+            name: "market_ticks_slug_timestamp",
+            fields: &["meta.slug", "timestamp"],
+            unique: false,
+            ttl_seconds: Some(7 * 24 * 60 * 60),
+        },
+        MongoIndexSpec {
+            collection: CollectionKind::FeatureWindows,
+            name: "feature_windows_slug_window_ts",
+            fields: &["slug", "window_ts"],
+            unique: true,
+            ttl_seconds: None,
+        },
+        MongoIndexSpec {
+            collection: CollectionKind::FeatureWindows,
+            name: "feature_windows_feature_vector",
+            fields: &["feature_vector"],
+            unique: false,
+            ttl_seconds: None,
+        },
+        MongoIndexSpec {
+            collection: CollectionKind::RegimeStates,
+            name: "regime_states_updated_at",
+            fields: &["updated_at"],
+            unique: false,
+            ttl_seconds: None,
+        },
+        MongoIndexSpec {
+            collection: CollectionKind::Alerts,
+            name: "alerts_slug_created_at",
+            fields: &["slug", "created_at"],
+            unique: false,
+            ttl_seconds: None,
+        },
+        MongoIndexSpec {
+            collection: CollectionKind::AgentSummaries,
+            name: "agent_summaries_bucket_start",
+            fields: &["bucket_start"],
+            unique: true,
+            ttl_seconds: None,
+        },
+        MongoIndexSpec {
+            collection: CollectionKind::BacktestRuns,
+            name: "backtest_runs_created_at",
+            fields: &["created_at"],
+            unique: false,
+            ttl_seconds: None,
+        },
+    ]
 }
 
 fn first_point_at_or_after(points: &[PricePoint], timestamp_ms: i64) -> Option<&PricePoint> {
