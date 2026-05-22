@@ -265,7 +265,11 @@ async fn openapi_spec_exposes_agent_builder_read_tools() {
         .expect("openapi body");
     let payload: Value = serde_json::from_slice(&body).expect("openapi json");
 
-    assert_eq!(payload["openapi"], "3.1.0");
+    assert_eq!(payload["openapi"], "3.0.3");
+    assert_eq!(
+        payload["servers"][0]["url"],
+        "https://regime-sentinel-agent-998092298764.asia-northeast1.run.app"
+    );
     assert_eq!(
         payload["paths"]["/api/dashboard/snapshot"]["get"]["operationId"],
         "getDashboardSnapshot"
@@ -273,5 +277,14 @@ async fn openapi_spec_exposes_agent_builder_read_tools() {
     assert_eq!(
         payload["paths"]["/api/replay/validate"]["post"]["operationId"],
         "validateReplay"
+    );
+    assert_eq!(
+        payload["paths"]["/api/replay/validate"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/ReplayValidationRequest"
+    );
+    assert_eq!(
+        payload["components"]["schemas"]["ReplayValidationRequest"]["required"][0],
+        "price_points"
     );
 }

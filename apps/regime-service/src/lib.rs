@@ -2163,11 +2163,16 @@ async fn health() -> Json<HealthResponse> {
 
 async fn openapi_spec() -> Json<serde_json::Value> {
     Json(serde_json::json!({
-        "openapi": "3.1.0",
+        "openapi": "3.0.3",
         "info": {
             "title": "Regime Sentinel Agent API",
             "version": regime_core::VERSION
         },
+        "servers": [
+            {
+                "url": "https://regime-sentinel-agent-998092298764.asia-northeast1.run.app"
+            }
+        ],
         "paths": {
             "/health": {
                 "get": {
@@ -2195,9 +2200,243 @@ async fn openapi_spec() -> Json<serde_json::Value> {
                 "post": {
                     "operationId": "validateReplay",
                     "summary": "Validate replay alerts against generated shift labels",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ReplayValidationRequest"
+                                }
+                            }
+                        }
+                    },
                     "responses": {
                         "200": {
                             "description": "Replay validation report"
+                        }
+                    }
+                }
+            }
+        },
+        "components": {
+            "schemas": {
+                "ReplayValidationRequest": {
+                    "type": "object",
+                    "required": ["price_points", "label_config", "synchronous_tolerance_ms"],
+                    "properties": {
+                        "price_points": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/components/schemas/PricePoint"
+                            }
+                        },
+                        "alerts": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/components/schemas/AlertRecord"
+                            },
+                            "default": []
+                        },
+                        "feature_windows": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/components/schemas/FeatureWindowRecord"
+                            },
+                            "default": []
+                        },
+                        "score_weights": {
+                            "$ref": "#/components/schemas/ScoreWeights"
+                        },
+                        "score_thresholds": {
+                            "$ref": "#/components/schemas/ScoreThresholds"
+                        },
+                        "alert_horizon_ms": {
+                            "type": "integer",
+                            "format": "int64"
+                        },
+                        "label_config": {
+                            "$ref": "#/components/schemas/ShiftLabelConfig"
+                        },
+                        "synchronous_tolerance_ms": {
+                            "type": "integer",
+                            "format": "int64"
+                        }
+                    }
+                },
+                "PricePoint": {
+                    "type": "object",
+                    "required": ["timestamp_ms", "p_mid"],
+                    "properties": {
+                        "timestamp_ms": {
+                            "type": "integer",
+                            "format": "int64"
+                        },
+                        "p_mid": {
+                            "type": "number",
+                            "format": "double"
+                        }
+                    }
+                },
+                "AlertRecord": {
+                    "type": "object",
+                    "required": ["timestamp_ms", "state", "confidence", "horizon_ms", "score"],
+                    "properties": {
+                        "timestamp_ms": {
+                            "type": "integer",
+                            "format": "int64"
+                        },
+                        "state": {
+                            "type": "string",
+                            "enum": ["Equilibrium", "Watch", "EarlyRisk", "ShiftDetected"]
+                        },
+                        "confidence": {
+                            "type": "string",
+                            "enum": ["Normal", "Low"]
+                        },
+                        "horizon_ms": {
+                            "type": "integer",
+                            "format": "int64"
+                        },
+                        "score": {
+                            "type": "number",
+                            "format": "double"
+                        }
+                    }
+                },
+                "FeatureWindowRecord": {
+                    "type": "object",
+                    "required": [
+                        "slug",
+                        "window_ts_ms",
+                        "window_ms",
+                        "p_mid",
+                        "p_fair",
+                        "fair_gap",
+                        "ofi_1s",
+                        "depth_imbalance",
+                        "spread",
+                        "volume_acceleration",
+                        "feature_vector"
+                    ],
+                    "properties": {
+                        "slug": {
+                            "type": "string"
+                        },
+                        "window_ts_ms": {
+                            "type": "integer",
+                            "format": "int64"
+                        },
+                        "window_ms": {
+                            "type": "integer",
+                            "format": "int64"
+                        },
+                        "p_mid": {
+                            "type": "number",
+                            "format": "double"
+                        },
+                        "p_fair": {
+                            "type": "number",
+                            "format": "double"
+                        },
+                        "fair_gap": {
+                            "type": "number",
+                            "format": "double"
+                        },
+                        "ofi_1s": {
+                            "type": "number",
+                            "format": "double"
+                        },
+                        "depth_imbalance": {
+                            "type": "number",
+                            "format": "double"
+                        },
+                        "spread": {
+                            "type": "number",
+                            "format": "double"
+                        },
+                        "volume_acceleration": {
+                            "type": "number",
+                            "format": "double"
+                        },
+                        "feature_vector": {
+                            "type": "array",
+                            "items": {
+                                "type": "number",
+                                "format": "double"
+                            },
+                            "minItems": 5,
+                            "maxItems": 5
+                        }
+                    }
+                },
+                "ScoreWeights": {
+                    "type": "object",
+                    "required": [
+                        "fair_gap_velocity",
+                        "depth_imbalance",
+                        "ofi_1s",
+                        "volume_acceleration",
+                        "stale_data_penalty"
+                    ],
+                    "properties": {
+                        "fair_gap_velocity": {
+                            "type": "number",
+                            "format": "double"
+                        },
+                        "depth_imbalance": {
+                            "type": "number",
+                            "format": "double"
+                        },
+                        "ofi_1s": {
+                            "type": "number",
+                            "format": "double"
+                        },
+                        "volume_acceleration": {
+                            "type": "number",
+                            "format": "double"
+                        },
+                        "stale_data_penalty": {
+                            "type": "number",
+                            "format": "double"
+                        }
+                    }
+                },
+                "ScoreThresholds": {
+                    "type": "object",
+                    "required": ["watch", "early_risk", "shift_detected_move"],
+                    "properties": {
+                        "watch": {
+                            "type": "number",
+                            "format": "double"
+                        },
+                        "early_risk": {
+                            "type": "number",
+                            "format": "double"
+                        },
+                        "shift_detected_move": {
+                            "type": "number",
+                            "format": "double"
+                        }
+                    }
+                },
+                "ShiftLabelConfig": {
+                    "type": "object",
+                    "required": ["horizons_ms", "min_move", "persist_ms"],
+                    "properties": {
+                        "horizons_ms": {
+                            "type": "array",
+                            "items": {
+                                "type": "integer",
+                                "format": "int64"
+                            }
+                        },
+                        "min_move": {
+                            "type": "number",
+                            "format": "double"
+                        },
+                        "persist_ms": {
+                            "type": "integer",
+                            "format": "int64"
                         }
                     }
                 }
