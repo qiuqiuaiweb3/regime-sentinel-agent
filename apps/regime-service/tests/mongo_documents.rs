@@ -1,7 +1,7 @@
 use mongodb::bson::Bson;
 use regime_core::{
-    AlertEventRecord, FeatureWindowMetrics, MarketTickMeta, MarketTickRecord, RegimeStateRecord,
-    build_feature_window,
+    AgentSummaryRecord, AlertEventRecord, BacktestRunRecord, FeatureWindowMetrics, MarketTickMeta,
+    MarketTickRecord, RegimeStateRecord, build_feature_window,
 };
 
 #[test]
@@ -163,4 +163,70 @@ fn alert_insert_matches_alert_schema() {
     assert_eq!(insert.document.get_str("severity"), Ok("HIGH"));
     assert_eq!(insert.document.get_str("state"), Ok("EARLY_RISK"));
     assert_eq!(insert.document.get_bool("gemini_explained"), Ok(false));
+}
+
+#[test]
+fn agent_summary_insert_matches_summary_schema() {
+    let summary = AgentSummaryRecord {
+        bucket_start_ms: 1_769_000_000_000,
+        bucket_seconds: 1_800,
+        model: "gemini-3-flash-preview".to_string(),
+        thinking_level: "LOW".to_string(),
+        summary: "Risk rose but no confirmed shift.".to_string(),
+        alert_ids: vec!["alert-1".to_string()],
+        similar_window_ids: vec!["window-1".to_string()],
+        token_usage: serde_json::json!({"input": 100, "output": 40}),
+    };
+
+    let insert = regime_service::mongo_documents::agent_summary_insert(&summary);
+
+    assert_eq!(insert.collection_name, "agent_summaries");
+    assert_eq!(
+        insert
+            .document
+            .get_datetime("bucket_start")
+            .map(|value| value.timestamp_millis()),
+        Ok(1_769_000_000_000)
+    );
+    assert_eq!(insert.document.get_i32("bucket_seconds"), Ok(1_800));
+    assert_eq!(
+        insert.document.get_str("model"),
+        Ok("gemini-3-flash-preview")
+    );
+    assert_eq!(
+        insert
+            .document
+            .get_document("token_usage")
+            .and_then(|usage| usage.get_i64("output")),
+        Ok(40)
+    );
+}
+
+#[test]
+fn backtest_run_insert_matches_validation_schema() {
+    let run = BacktestRunRecord {
+        created_at_ms: 1_769_000_000_999,
+        parameters: serde_json::json!({"watch": 0.5, "early_risk": 1.0}),
+        data_range: serde_json::json!({"start_ms": 1, "end_ms": 2}),
+        metrics: serde_json::json!({"early": 2, "false_alerts": 1}),
+        ablation: serde_json::json!({"without_ofi_1s": {"early": 1}}),
+    };
+
+    let insert = regime_service::mongo_documents::backtest_run_insert(&run);
+
+    assert_eq!(insert.collection_name, "backtest_runs");
+    assert_eq!(
+        insert
+            .document
+            .get_datetime("created_at")
+            .map(|value| value.timestamp_millis()),
+        Ok(1_769_000_000_999)
+    );
+    assert_eq!(
+        insert
+            .document
+            .get_document("metrics")
+            .and_then(|metrics| metrics.get_i64("early")),
+        Ok(2)
+    );
 }

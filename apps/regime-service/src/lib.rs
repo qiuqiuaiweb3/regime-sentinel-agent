@@ -284,7 +284,10 @@ pub mod mongo_bootstrap {
 
 pub mod mongo_documents {
     use mongodb::bson::{Bson, DateTime, Document, doc};
-    use regime_core::{AlertEventRecord, FeatureWindowRecord, MarketTickRecord, RegimeStateRecord};
+    use regime_core::{
+        AgentSummaryRecord, AlertEventRecord, BacktestRunRecord, FeatureWindowRecord,
+        MarketTickRecord, RegimeStateRecord,
+    };
 
     #[derive(Debug, Clone)]
     pub struct MongoInsertDocument {
@@ -334,6 +337,20 @@ pub mod mongo_documents {
         }
     }
 
+    pub fn agent_summary_insert(summary: &AgentSummaryRecord) -> MongoInsertDocument {
+        MongoInsertDocument {
+            collection_name: "agent_summaries",
+            document: agent_summary_document(summary),
+        }
+    }
+
+    pub fn backtest_run_insert(run: &BacktestRunRecord) -> MongoInsertDocument {
+        MongoInsertDocument {
+            collection_name: "backtest_runs",
+            document: backtest_run_document(run),
+        }
+    }
+
     pub fn feature_window_document(window: &FeatureWindowRecord) -> Document {
         let feature_vector = window
             .feature_vector
@@ -379,8 +396,7 @@ pub mod mongo_documents {
             "confidence": state.confidence,
             "updated_at": DateTime::from_millis(state.updated_at_ms),
             "previous_regime": &state.previous_regime,
-            "indicators": mongodb::bson::to_bson(&state.indicators)
-                .expect("serde_json indicators convert to BSON"),
+            "indicators": json_to_bson(&state.indicators),
             "market_resolved": state.market_resolved,
         }
     }
@@ -397,14 +413,45 @@ pub mod mongo_documents {
             "gemini_explained": alert.gemini_explained,
         }
     }
+
+    pub fn agent_summary_document(summary: &AgentSummaryRecord) -> Document {
+        doc! {
+            "bucket_start": DateTime::from_millis(summary.bucket_start_ms),
+            "bucket_seconds": summary.bucket_seconds as i32,
+            "model": &summary.model,
+            "thinking_level": &summary.thinking_level,
+            "summary": &summary.summary,
+            "alert_ids": summary.alert_ids.clone(),
+            "similar_window_ids": summary.similar_window_ids.clone(),
+            "token_usage": json_to_bson(&summary.token_usage),
+        }
+    }
+
+    pub fn backtest_run_document(run: &BacktestRunRecord) -> Document {
+        doc! {
+            "created_at": DateTime::from_millis(run.created_at_ms),
+            "parameters": json_to_bson(&run.parameters),
+            "data_range": json_to_bson(&run.data_range),
+            "metrics": json_to_bson(&run.metrics),
+            "ablation": json_to_bson(&run.ablation),
+        }
+    }
+
+    fn json_to_bson(value: &serde_json::Value) -> Bson {
+        mongodb::bson::to_bson(value).expect("serde_json value converts to BSON")
+    }
 }
 
 pub mod mongo_store {
     use mongodb::{Database, bson::Document};
-    use regime_core::{AlertEventRecord, FeatureWindowRecord, MarketTickRecord, RegimeStateRecord};
+    use regime_core::{
+        AgentSummaryRecord, AlertEventRecord, BacktestRunRecord, FeatureWindowRecord,
+        MarketTickRecord, RegimeStateRecord,
+    };
 
     use crate::mongo_documents::{
-        alert_insert, feature_window_insert, market_tick_insert, regime_state_upsert,
+        agent_summary_insert, alert_insert, backtest_run_insert, feature_window_insert,
+        market_tick_insert, regime_state_upsert,
     };
     use crate::similar_windows::similar_windows_pipeline;
 
@@ -460,6 +507,32 @@ pub mod mongo_store {
 
         pub async fn insert_alert(&self, alert: &AlertEventRecord) -> mongodb::error::Result<()> {
             let insert = alert_insert(alert);
+            self.db
+                .collection::<Document>(insert.collection_name)
+                .insert_one(insert.document)
+                .await?;
+
+            Ok(())
+        }
+
+        pub async fn insert_agent_summary(
+            &self,
+            summary: &AgentSummaryRecord,
+        ) -> mongodb::error::Result<()> {
+            let insert = agent_summary_insert(summary);
+            self.db
+                .collection::<Document>(insert.collection_name)
+                .insert_one(insert.document)
+                .await?;
+
+            Ok(())
+        }
+
+        pub async fn insert_backtest_run(
+            &self,
+            run: &BacktestRunRecord,
+        ) -> mongodb::error::Result<()> {
+            let insert = backtest_run_insert(run);
             self.db
                 .collection::<Document>(insert.collection_name)
                 .insert_one(insert.document)

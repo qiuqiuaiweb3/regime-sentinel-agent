@@ -82,6 +82,27 @@ pub struct AlertEventRecord {
     pub gemini_explained: bool,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
+pub struct AgentSummaryRecord {
+    pub bucket_start_ms: i64,
+    pub bucket_seconds: i64,
+    pub model: String,
+    pub thinking_level: String,
+    pub summary: String,
+    pub alert_ids: Vec<String>,
+    pub similar_window_ids: Vec<String>,
+    pub token_usage: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
+pub struct BacktestRunRecord {
+    pub created_at_ms: i64,
+    pub parameters: serde_json::Value,
+    pub data_range: serde_json::Value,
+    pub metrics: serde_json::Value,
+    pub ablation: serde_json::Value,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Serialize)]
 pub struct ScoreWeights {
     pub fair_gap_velocity: f64,
