@@ -445,6 +445,70 @@ async fn dashboard_snapshot_endpoint_accepts_replay_mode() {
 }
 
 #[tokio::test]
+async fn dashboard_snapshot_endpoint_reads_live_ndjson_when_available() {
+    let temp_dir = tempfile::tempdir().expect("live dashboard temp dir");
+    let market_path = temp_dir.path().join("live.market.ndjson");
+    let reference_path = temp_dir.path().join("live.reference.ndjson");
+    fs::write(
+        &market_path,
+        r#"{"kind":"market_tick","record":{"timestamp_ms":1779493999000,"meta":{"slug":"btc-updown-5m-live","series":"btc-updown-5m","source":"clob"},"price":0.50,"size":0.0,"side":"BBA","outcome":"Up","receive_lag_ms":25}}
+{"kind":"market_tick","record":{"timestamp_ms":1779494000000,"meta":{"slug":"btc-updown-5m-live","series":"btc-updown-5m","source":"clob"},"price":0.57,"size":0.0,"side":"BBA","outcome":"Up","receive_lag_ms":25}}
+{"kind":"market_tick","record":{"timestamp_ms":1779494000000,"meta":{"slug":"btc-updown-5m-live","series":"btc-updown-5m","source":"clob"},"price":0.58,"size":10.0,"side":"BUY","outcome":"Up","receive_lag_ms":25}}
+{"kind":"market_tick","record":{"timestamp_ms":1779494000000,"meta":{"slug":"btc-updown-5m-live","series":"btc-updown-5m","source":"clob"},"price":0.42,"size":5.0,"side":"SELL","outcome":"Down","receive_lag_ms":25}}
+"#,
+    )
+    .expect("write market ndjson");
+    fs::write(
+        &reference_path,
+        r#"{"kind":"market_tick","record":{"timestamp_ms":1779493999000,"meta":{"slug":"btc-updown-5m-live","series":"btc-updown-5m","source":"chainlink"},"price":109990.0,"size":0.0,"side":"ORACLE","outcome":"btc/usd","receive_lag_ms":10}}
+{"kind":"market_tick","record":{"timestamp_ms":1779494000100,"meta":{"slug":"btc-updown-5m-live","series":"btc-updown-5m","source":"chainlink"},"price":110000.0,"size":0.0,"side":"ORACLE","outcome":"btc/usd","receive_lag_ms":10}}
+"#,
+    )
+    .expect("write reference ndjson");
+
+    let response =
+        regime_service::build_router_with_live_dashboard_paths(market_path, reference_path)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dashboard/snapshot")
+                    .body(Body::empty())
+                    .expect("snapshot request"),
+            )
+            .await
+            .expect("snapshot response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("snapshot body");
+    let payload: Value = serde_json::from_slice(&body).expect("snapshot json");
+
+    assert_eq!(payload["regime"]["state"], "SHIFT_RISK");
+    assert!(
+        payload["regime"]["description"]
+            .as_str()
+            .expect("regime description")
+            .contains("Up-side")
+    );
+    assert_eq!(payload["regime"]["updated_at_ms"], 1779494000100_i64);
+    assert_eq!(payload["market"]["slug"], "btc-updown-5m-live");
+    assert_eq!(payload["market"]["series"], "btc-updown-5m");
+    assert_eq!(payload["market"]["title"], "btc-updown-5m-live");
+    assert_eq!(
+        payload["price_points"][0]["timestamp_ms"],
+        1779493999000_i64
+    );
+    assert_eq!(payload["price_points"][1]["p_mid"], 0.57);
+    assert_eq!(payload["similar_windows"][0]["slug"], "btc-updown-5m-live");
+    assert_eq!(payload["regime_indicators"][0]["key"], "fair_gap");
+    assert!((payload["regime_indicators"][0]["value"].as_f64().unwrap() - 0.07).abs() < 0.001);
+    assert_eq!(payload["regime_indicators"][1]["key"], "mid_velocity_1s");
+    assert!((payload["regime_indicators"][1]["value"].as_f64().unwrap() - 0.07).abs() < 0.001);
+    assert_eq!(payload["regime_indicators"][2]["key"], "order_flow_1s");
+    assert_eq!(payload["regime_indicators"][2]["value"], 1.0);
+}
+
+#[tokio::test]
 async fn dashboard_events_endpoint_exposes_sse_stream() {
     let response = regime_service::build_router()
         .oneshot(
@@ -535,7 +599,7 @@ async fn openapi_spec_exposes_agent_builder_read_tools() {
     assert_eq!(payload["openapi"], "3.0.3");
     assert_eq!(
         payload["servers"][0]["url"],
-        "https://regime-sentinel-agent-998092298764.asia-northeast1.run.app"
+        "https://regime-sentinel-agent-998092298764.asia-northeast3.run.app"
     );
     assert_eq!(
         payload["paths"]["/api/dashboard/snapshot"]["get"]["operationId"],

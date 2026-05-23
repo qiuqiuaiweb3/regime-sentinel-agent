@@ -49,7 +49,7 @@ async fn main() -> anyhow::Result<()> {
     let reference_report =
         summarize_live_smoke_ndjson(&config.slug, duration_seconds, &reference_path)?;
     let mut required_outcomes: Vec<&str> = config.outcomes.iter().map(String::as_str).collect();
-    required_outcomes.push(config.reference_product_id.as_str());
+    required_outcomes.push(config.reference_symbol.as_str());
     let report = combine_reports(
         &config.slug,
         duration_seconds,
@@ -62,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
     println!("{}", serde_json::to_string_pretty(&report)?);
 
     if !report.passed {
-        bail!("live smoke did not observe CLOB, Coinbase, and all configured outcomes");
+        bail!("live smoke did not observe CLOB, Chainlink, and all configured outcomes");
     }
 
     Ok(())
@@ -98,6 +98,7 @@ fn combine_reports(
         slug: slug.to_string(),
         duration_seconds,
         ndjson_path: format!("{};{}", market_path.display(), reference_path.display()),
+        ndjson_bytes: market_report.ndjson_bytes + reference_report.ndjson_bytes,
         market_ticks,
         reference_ticks,
         stale_states,

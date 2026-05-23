@@ -796,7 +796,7 @@ pub fn mongo_collection_specs() -> [MongoCollectionSpec; 6] {
             time_series: Some(TimeSeriesSpec {
                 time_field: "timestamp",
                 meta_field: "meta",
-                expire_after_seconds: 7 * 24 * 60 * 60,
+                expire_after_seconds: 60 * 60,
             }),
         },
         MongoCollectionSpec {

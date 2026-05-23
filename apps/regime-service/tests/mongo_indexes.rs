@@ -16,7 +16,7 @@ fn collection_create_models_include_time_series_ttl_for_market_ticks() {
     assert_eq!(timeseries.meta_field.as_deref(), Some("meta"));
     assert_eq!(
         options.expire_after_seconds,
-        Some(Duration::from_secs(604_800))
+        Some(Duration::from_secs(3_600))
     );
 
     let alerts = models

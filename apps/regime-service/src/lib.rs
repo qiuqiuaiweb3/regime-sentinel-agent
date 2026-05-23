@@ -9,12 +9,16 @@ use axum::{
 use futures_util::stream;
 use regime_core::{
     AblationMetric, AlertRecord, FairProbabilityFeatureWindowRecord, FeatureWindowRecord,
-    PricePoint, ScoreThresholds, ScoreWeights, ShiftLabel, ShiftLabelConfig, ValidationReport,
-    ablation_report_from_feature_windows, build_feature_window_from_fair_probability_record,
-    generate_alerts_from_feature_windows, generate_shift_labels, validate_alerts_for_market,
+    MarketTickRecord, PricePoint, ScoreThresholds, ScoreWeights, ShiftLabel, ShiftLabelConfig,
+    ValidationReport, ablation_report_from_feature_windows,
+    build_feature_window_from_fair_probability_record, generate_alerts_from_feature_windows,
+    generate_shift_labels, validate_alerts_for_market,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::convert::Infallible;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -260,6 +264,10 @@ pub mod mongo_bootstrap {
 
     pub async fn bootstrap_mongodb(db: &Database) -> mongodb::error::Result<MongoBootstrapSummary> {
         let existing_collection_names = db.list_collection_names().await?;
+        let existing_collection_names_set = existing_collection_names
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
         let plan = mongo_bootstrap_plan(existing_collection_names);
 
         for model in collection_create_models()
@@ -276,6 +284,22 @@ pub mod mongo_bootstrap {
                 }
             }
             create.await?;
+        }
+
+        for model in collection_create_models()
+            .into_iter()
+            .filter(|model| existing_collection_names_set.contains(model.collection_name))
+        {
+            if let Some(expire_after_seconds) = model
+                .options
+                .and_then(|options| options.expire_after_seconds)
+            {
+                db.run_command(mongodb::bson::doc! {
+                    "collMod": model.collection_name,
+                    "expireAfterSeconds": expire_after_seconds.as_secs() as i64,
+                })
+                .await?;
+            }
         }
 
         for model in regular_index_models() {
@@ -315,6 +339,12 @@ pub mod mongo_documents {
         pub upsert: bool,
     }
 
+    #[derive(Debug, Clone)]
+    pub struct MongoDeleteDocument {
+        pub collection_name: &'static str,
+        pub filter: Document,
+    }
+
     pub fn feature_window_insert(window: &FeatureWindowRecord) -> MongoInsertDocument {
         MongoInsertDocument {
             collection_name: "feature_windows",
@@ -327,6 +357,27 @@ pub mod mongo_documents {
             collection_name: "market_ticks",
             document: market_tick_document(tick),
         }
+    }
+
+    pub fn market_data_retention_deletes(slugs: &[String]) -> Vec<MongoDeleteDocument> {
+        vec![
+            MongoDeleteDocument {
+                collection_name: "market_ticks",
+                filter: doc! { "meta.slug": { "$in": slugs } },
+            },
+            MongoDeleteDocument {
+                collection_name: "feature_windows",
+                filter: doc! { "slug": { "$in": slugs } },
+            },
+            MongoDeleteDocument {
+                collection_name: "alerts",
+                filter: doc! { "slug": { "$in": slugs } },
+            },
+            MongoDeleteDocument {
+                collection_name: "regime_states",
+                filter: doc! { "_id": { "$in": slugs } },
+            },
+        ]
     }
 
     pub fn regime_state_upsert(state: &RegimeStateRecord) -> MongoUpdateDocument {
@@ -353,6 +404,19 @@ pub mod mongo_documents {
         MongoInsertDocument {
             collection_name: "agent_summaries",
             document: agent_summary_document(summary),
+        }
+    }
+
+    pub fn agent_summary_bucket_upsert(summary: &AgentSummaryRecord) -> MongoUpdateDocument {
+        MongoUpdateDocument {
+            collection_name: "agent_summaries",
+            filter: doc! {
+                "bucket_start": DateTime::from_millis(summary.bucket_start_ms),
+            },
+            update: doc! {
+                "$set": agent_summary_document(summary),
+            },
+            upsert: true,
         }
     }
 
@@ -465,8 +529,9 @@ pub mod mongo_store {
     };
 
     use crate::mongo_documents::{
-        agent_summary_insert, alert_insert, backtest_run_insert, feature_window_insert,
-        market_tick_insert, regime_state_upsert,
+        agent_summary_bucket_upsert, agent_summary_insert, alert_insert, backtest_run_insert,
+        feature_window_insert, market_data_retention_deletes, market_tick_insert,
+        regime_state_upsert,
     };
     use crate::similar_windows::similar_windows_pipeline;
 
@@ -475,9 +540,77 @@ pub mod mongo_store {
         db: Database,
     }
 
+    #[derive(Debug, Clone, Default, serde::Serialize)]
+    pub struct MarketRetentionReport {
+        pub retained_markets: usize,
+        pub deleted_slugs: Vec<String>,
+        pub deleted_market_ticks: u64,
+        pub deleted_feature_windows: u64,
+        pub deleted_alerts: u64,
+        pub deleted_regime_states: u64,
+    }
+
     impl MongoStore {
         pub fn new(db: Database) -> Self {
             Self { db }
+        }
+
+        pub async fn prune_old_market_data(
+            &self,
+            retained_markets: usize,
+        ) -> mongodb::error::Result<MarketRetentionReport> {
+            let mut cursor = self
+                .db
+                .collection::<Document>("market_ticks")
+                .aggregate(vec![
+                    doc! {
+                        "$group": {
+                            "_id": "$meta.slug",
+                            "last_timestamp": { "$max": "$timestamp" }
+                        }
+                    },
+                    doc! { "$sort": { "last_timestamp": -1 } },
+                    doc! { "$skip": retained_markets as i64 },
+                    doc! { "$project": { "_id": 1 } },
+                ])
+                .await?;
+            let mut deleted_slugs = Vec::new();
+            while cursor.advance().await? {
+                let document = cursor.deserialize_current()?;
+                if let Ok(slug) = document.get_str("_id") {
+                    deleted_slugs.push(slug.to_string());
+                }
+            }
+
+            if deleted_slugs.is_empty() {
+                return Ok(MarketRetentionReport {
+                    retained_markets,
+                    ..MarketRetentionReport::default()
+                });
+            }
+
+            let mut report = MarketRetentionReport {
+                retained_markets,
+                deleted_slugs: deleted_slugs.clone(),
+                ..MarketRetentionReport::default()
+            };
+            for delete in market_data_retention_deletes(&deleted_slugs) {
+                let deleted_count = self
+                    .db
+                    .collection::<Document>(delete.collection_name)
+                    .delete_many(delete.filter)
+                    .await?
+                    .deleted_count;
+                match delete.collection_name {
+                    "market_ticks" => report.deleted_market_ticks = deleted_count,
+                    "feature_windows" => report.deleted_feature_windows = deleted_count,
+                    "alerts" => report.deleted_alerts = deleted_count,
+                    "regime_states" => report.deleted_regime_states = deleted_count,
+                    _ => {}
+                }
+            }
+
+            Ok(report)
         }
 
         pub async fn insert_feature_window(
@@ -538,6 +671,29 @@ pub mod mongo_store {
             self.db
                 .collection::<Document>(insert.collection_name)
                 .insert_one(insert.document)
+                .await?;
+
+            Ok(())
+        }
+
+        pub async fn replace_agent_summary(
+            &self,
+            summary: &AgentSummaryRecord,
+        ) -> mongodb::error::Result<()> {
+            let update = agent_summary_bucket_upsert(summary);
+            self.db
+                .collection::<Document>(update.collection_name)
+                .update_one(update.filter, update.update)
+                .upsert(update.upsert)
+                .await?;
+
+            self.db
+                .collection::<Document>("agent_summaries")
+                .delete_many(doc! {
+                    "bucket_start": {
+                        "$lt": mongodb::bson::DateTime::from_millis(summary.bucket_start_ms)
+                    }
+                })
                 .await?;
 
             Ok(())
@@ -1130,7 +1286,7 @@ pub mod gemini_summary {
         "https://generativelanguage.googleapis.com/v1beta";
     pub const DEFAULT_GEMINI_MODEL: &str = "gemini-3-pro-preview";
     pub const DEFAULT_GEMINI_THINKING_LEVEL: &str = "low";
-    pub const DEFAULT_GEMINI_LOCATION: &str = "global";
+    pub const DEFAULT_GEMINI_LOCATION: &str = "asia-northeast3";
 
     #[derive(Debug, Clone, Copy, Eq, PartialEq)]
     pub enum GeminiProvider {
@@ -1229,7 +1385,7 @@ pub mod gemini_summary {
         config: &GeminiSummaryConfig,
         prompt: &str,
     ) -> Result<GeminiGenerateRequest, String> {
-        let body = json!({
+        let mut body = json!({
             "contents": [
                 {
                     "role": "user",
@@ -1240,12 +1396,14 @@ pub mod gemini_summary {
             ],
             "generationConfig": {
                 "temperature": 0.2,
-                "maxOutputTokens": 1024,
-                "thinkingConfig": {
-                    "thinkingLevel": config.thinking_level.to_ascii_uppercase()
-                }
+                "maxOutputTokens": 1024
             }
         });
+        if config.model.starts_with("gemini-3") {
+            body["generationConfig"]["thinkingConfig"] = json!({
+                "thinkingLevel": config.thinking_level.to_ascii_uppercase()
+            });
+        }
 
         match config.provider {
             GeminiProvider::DeveloperApi => {
@@ -1268,7 +1426,7 @@ pub mod gemini_summary {
                 Ok(GeminiGenerateRequest {
                     url: format!(
                         "{}/projects/{}/locations/{}/publishers/google/models/{}:generateContent",
-                        vertex_endpoint_base(&config.location),
+                        vertex_endpoint_base(&config.location, &config.model),
                         project_id,
                         config.location,
                         config.model
@@ -1288,8 +1446,8 @@ pub mod gemini_summary {
         }
     }
 
-    fn vertex_endpoint_base(location: &str) -> String {
-        if location == "global" {
+    fn vertex_endpoint_base(location: &str, model: &str) -> String {
+        if location == "global" || model.starts_with("gemini-3") {
             "https://aiplatform.googleapis.com/v1".to_string()
         } else {
             format!("https://{location}-aiplatform.googleapis.com/v1")
@@ -1439,7 +1597,7 @@ pub mod gemini_summary {
             );
         };
 
-        if let Err(error) = store.insert_agent_summary(summary).await {
+        if let Err(error) = store.replace_agent_summary(summary).await {
             tracing::warn!(
                 ?error,
                 "agent summary MongoDB write failed; using NDJSON fallback"
@@ -1530,7 +1688,6 @@ pub mod gemini_summary {
 
 pub mod live_collector {
     use anyhow::Context;
-    use chrono::DateTime;
     use futures_util::{SinkExt, StreamExt};
     use regime_core::{MarketTickMeta, MarketTickRecord, RegimeStateRecord};
     use serde::Serialize;
@@ -1540,11 +1697,12 @@ pub mod live_collector {
     use std::io::{BufRead, BufReader, Write};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
-    use tokio_tungstenite::{connect_async, tungstenite::Message};
+    use tokio::net::TcpStream;
+    use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
     pub const DEFAULT_MARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
-    pub const DEFAULT_REFERENCE_WS_URL: &str = "wss://ws-feed.exchange.coinbase.com";
-    pub const DEFAULT_REFERENCE_PRODUCT_ID: &str = "BTC-USD";
+    pub const DEFAULT_REFERENCE_WS_URL: &str = "wss://ws-live-data.polymarket.com";
+    pub const DEFAULT_REFERENCE_SYMBOL: &str = "btc/usd";
     pub const DEFAULT_STALE_AFTER_MS: i64 = 1_500;
 
     #[derive(Debug, Clone, PartialEq)]
@@ -1556,7 +1714,7 @@ pub mod live_collector {
         pub outcomes: Vec<String>,
         pub market_ws_url: String,
         pub reference_ws_url: String,
-        pub reference_product_id: String,
+        pub reference_symbol: String,
         pub ndjson_path: PathBuf,
         pub stale_after_ms: i64,
     }
@@ -1574,6 +1732,7 @@ pub mod live_collector {
         pub slug: String,
         pub duration_seconds: u64,
         pub ndjson_path: String,
+        pub ndjson_bytes: u64,
         pub market_ticks: usize,
         pub reference_ticks: usize,
         pub stale_states: usize,
@@ -1612,7 +1771,7 @@ pub mod live_collector {
                     outcomes: Vec::new(),
                     market_ws_url: market_ws_url.unwrap_or(DEFAULT_MARKET_WS_URL).to_string(),
                     reference_ws_url: DEFAULT_REFERENCE_WS_URL.to_string(),
-                    reference_product_id: DEFAULT_REFERENCE_PRODUCT_ID.to_string(),
+                    reference_symbol: DEFAULT_REFERENCE_SYMBOL.to_string(),
                     ndjson_path: PathBuf::from(ndjson_path.unwrap_or("data/live-fallback.ndjson")),
                     stale_after_ms,
                 });
@@ -1644,7 +1803,7 @@ pub mod live_collector {
                 outcomes,
                 market_ws_url: market_ws_url.unwrap_or(DEFAULT_MARKET_WS_URL).to_string(),
                 reference_ws_url: DEFAULT_REFERENCE_WS_URL.to_string(),
-                reference_product_id: DEFAULT_REFERENCE_PRODUCT_ID.to_string(),
+                reference_symbol: DEFAULT_REFERENCE_SYMBOL.to_string(),
                 ndjson_path: PathBuf::from(ndjson_path.unwrap_or("data/live-fallback.ndjson")),
                 stale_after_ms,
             })
@@ -1665,8 +1824,8 @@ pub mod live_collector {
             )?;
             config.reference_ws_url = std::env::var("REFERENCE_PRICE_WS_URL")
                 .unwrap_or_else(|_| DEFAULT_REFERENCE_WS_URL.to_string());
-            config.reference_product_id = std::env::var("REFERENCE_PRICE_PRODUCT_ID")
-                .unwrap_or_else(|_| DEFAULT_REFERENCE_PRODUCT_ID.to_string());
+            config.reference_symbol = std::env::var("REFERENCE_PRICE_SYMBOL")
+                .unwrap_or_else(|_| DEFAULT_REFERENCE_SYMBOL.to_string());
             Ok(config)
         }
 
@@ -1694,9 +1853,12 @@ pub mod live_collector {
 
         pub fn reference_subscription_message(&self) -> Value {
             json!({
-                "type": "subscribe",
-                "product_ids": [self.reference_product_id],
-                "channels": ["ticker", "heartbeat"]
+                "action": "subscribe",
+                "subscriptions": [{
+                    "topic": "crypto_prices_chainlink",
+                    "type": "*",
+                    "filters": json!({ "symbol": self.reference_symbol }).to_string()
+                }]
             })
         }
 
@@ -1729,24 +1891,30 @@ pub mod live_collector {
         market_ticks_from_value(&value, meta, received_at_ms)
     }
 
-    pub fn reference_tick_from_coinbase_message(
+    pub fn reference_tick_from_chainlink_message(
         payload: &str,
         config: &LiveCollectorConfig,
         received_at_ms: i64,
     ) -> Result<Option<MarketTickRecord>, String> {
+        if matches!(payload.trim(), "PING" | "PONG") {
+            return Ok(None);
+        }
         let value: Value = serde_json::from_str(payload)
             .map_err(|error| format!("invalid reference JSON: {error}"))?;
-        if value.get("type").and_then(Value::as_str) != Some("ticker") {
+        if value.get("topic").and_then(Value::as_str) != Some("crypto_prices_chainlink")
+            || value.get("type").and_then(Value::as_str) != Some("update")
+        {
             return Ok(None);
         }
-        let product_id = string_field(&value, "product_id")?;
-        if product_id != config.reference_product_id {
+        let payload = value
+            .get("payload")
+            .ok_or_else(|| "Chainlink reference message missing payload".to_string())?;
+        let symbol = string_field(payload, "symbol")?;
+        if symbol != config.reference_symbol {
             return Ok(None);
         }
-        let timestamp_ms = value
-            .get("time")
-            .and_then(Value::as_str)
-            .and_then(parse_rfc3339_ms)
+        let timestamp_ms = timestamp_ms(payload)
+            .or_else(|| timestamp_ms(&value))
             .unwrap_or(received_at_ms);
 
         Ok(Some(MarketTickRecord {
@@ -1754,12 +1922,12 @@ pub mod live_collector {
             meta: MarketTickMeta {
                 slug: config.slug.clone(),
                 series: config.series.clone(),
-                source: "coinbase".to_string(),
+                source: "chainlink".to_string(),
             },
-            price: f64_field(&value, "price")?,
+            price: f64_field(payload, "value")?,
             size: 0.0,
-            side: "TICKER".to_string(),
-            outcome: product_id.to_string(),
+            side: "ORACLE".to_string(),
+            outcome: symbol.to_string(),
             receive_lag_ms: (received_at_ms - timestamp_ms).max(0),
         }))
     }
@@ -1855,7 +2023,7 @@ pub mod live_collector {
         let mut last_event_timestamp_ms = None;
 
         loop {
-            let ws_stream = match connect_async(&config.market_ws_url).await {
+            let ws_stream = match connect_live_websocket(&config.market_ws_url).await {
                 Ok((ws_stream, _)) => ws_stream,
                 Err(error) => {
                     tracing::warn!(?error, "connect Polymarket market websocket failed");
@@ -1925,7 +2093,7 @@ pub mod live_collector {
         }
 
         loop {
-            let ws_stream = match connect_async(&config.reference_ws_url).await {
+            let ws_stream = match connect_live_websocket(&config.reference_ws_url).await {
                 Ok((ws_stream, _)) => ws_stream,
                 Err(error) => {
                     tracing::warn!(?error, "connect reference price websocket failed");
@@ -1941,49 +2109,70 @@ pub mod live_collector {
                 ))
                 .await
                 .context("send reference price subscription")?;
+            let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
 
-            while let Some(message) = read.next().await {
-                match message {
-                    Ok(Message::Text(text)) => {
-                        handle_reference_message(
-                            text.as_ref(),
-                            &config,
-                            store.as_ref(),
-                            &config.ndjson_path,
-                        )
-                        .await;
-                    }
-                    Ok(Message::Binary(bytes)) => {
-                        if let Ok(text) = std::str::from_utf8(&bytes) {
-                            handle_reference_message(
-                                text,
-                                &config,
-                                store.as_ref(),
-                                &config.ndjson_path,
-                            )
-                            .await;
-                        }
-                    }
-                    Ok(Message::Ping(payload)) => {
+            loop {
+                tokio::select! {
+                    _ = heartbeat.tick() => {
                         write
-                            .send(Message::Pong(payload))
+                            .send(Message::Text("PING".into()))
                             .await
-                            .context("send reference websocket pong")?;
+                            .context("send reference price heartbeat")?;
                     }
-                    Ok(Message::Close(close)) => {
-                        tracing::warn!(?close, "reference price websocket closed");
-                        break;
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        tracing::warn!(?error, "reference price websocket read failed");
-                        break;
+                    message = read.next() => {
+                        match message {
+                            Some(Ok(Message::Text(text))) => {
+                                handle_reference_message(
+                                    text.as_ref(),
+                                    &config,
+                                    store.as_ref(),
+                                    &config.ndjson_path,
+                                )
+                                .await;
+                            }
+                            Some(Ok(Message::Binary(bytes))) => {
+                                if let Ok(text) = std::str::from_utf8(&bytes) {
+                                    handle_reference_message(
+                                        text,
+                                        &config,
+                                        store.as_ref(),
+                                        &config.ndjson_path,
+                                    )
+                                    .await;
+                                }
+                            }
+                            Some(Ok(Message::Ping(payload))) => {
+                                write
+                                    .send(Message::Pong(payload))
+                                    .await
+                                    .context("send reference websocket pong")?;
+                            }
+                            Some(Ok(Message::Close(close))) => {
+                                tracing::warn!(?close, "reference price websocket closed");
+                                break;
+                            }
+                            Some(Ok(_)) => {}
+                            Some(Err(error)) => {
+                                tracing::warn!(?error, "reference price websocket read failed");
+                                break;
+                            }
+                            None => break,
+                        }
                     }
                 }
             }
 
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
+    }
+
+    async fn connect_live_websocket(
+        url: &str,
+    ) -> tokio_tungstenite::tungstenite::Result<(
+        WebSocketStream<MaybeTlsStream<TcpStream>>,
+        tokio_tungstenite::tungstenite::handshake::client::Response,
+    )> {
+        connect_async(url).await
     }
 
     pub fn append_ndjson_fallback<T: Serialize>(
@@ -2050,7 +2239,7 @@ pub mod live_collector {
 
             match record["meta"]["source"].as_str() {
                 Some("clob") => market_ticks += 1,
-                Some("coinbase") => reference_ticks += 1,
+                Some("chainlink") => reference_ticks += 1,
                 _ => {}
             }
             if let Some(outcome) = record["outcome"].as_str() {
@@ -2070,11 +2259,15 @@ pub mod live_collector {
 
         let outcomes: Vec<String> = outcomes.into_iter().collect();
         let passed = live_smoke_passed(market_ticks, reference_ticks, &outcomes, &[]);
+        let ndjson_bytes = std::fs::metadata(path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
 
         Ok(LiveSmokeReport {
             slug: slug.to_string(),
             duration_seconds,
             ndjson_path: path.display().to_string(),
+            ndjson_bytes,
             market_ticks,
             reference_ticks,
             stale_states,
@@ -2128,7 +2321,7 @@ pub mod live_collector {
         store: Option<&crate::mongo_store::MongoStore>,
         fallback_path: &Path,
     ) {
-        match reference_tick_from_coinbase_message(payload, config, unix_timestamp_ms()) {
+        match reference_tick_from_chainlink_message(payload, config, unix_timestamp_ms()) {
             Ok(Some(tick)) => {
                 if let Err(error) =
                     persist_market_tick_or_fallback(store, &tick, fallback_path).await
@@ -2282,12 +2475,6 @@ pub mod live_collector {
             })
     }
 
-    fn parse_rfc3339_ms(value: &str) -> Option<i64> {
-        DateTime::parse_from_rfc3339(value)
-            .map(|timestamp| timestamp.timestamp_millis())
-            .ok()
-    }
-
     fn string_field<'a>(value: &'a Value, field: &str) -> Result<&'a str, String> {
         value
             .get(field)
@@ -2401,6 +2588,7 @@ pub struct FindSimilarWindowsRequest {
 struct AppState {
     agent_tool_mongodb_enabled: bool,
     manual_explain: ManualExplainRuntime,
+    live_dashboard_paths: Option<LiveDashboardPaths>,
 }
 
 #[derive(Debug, Clone)]
@@ -2422,6 +2610,12 @@ enum ManualExplainMode {
     DryRun,
 }
 
+#[derive(Debug, Clone)]
+struct LiveDashboardPaths {
+    market_path: PathBuf,
+    reference_path: PathBuf,
+}
+
 const DEFAULT_AGENT_TOOL_MONGODB_TIMEOUT_MS: u64 = 1_500;
 const MIN_AGENT_TOOL_MONGODB_TIMEOUT_MS: u64 = 250;
 const MAX_AGENT_TOOL_MONGODB_TIMEOUT_MS: u64 = 5_000;
@@ -2441,11 +2635,13 @@ pub fn agent_tool_mongodb_timeout_from_value(raw_value: Option<&str>) -> Duratio
 #[derive(Debug, Serialize)]
 pub struct DashboardSnapshot {
     mode: String,
+    market: DashboardMarket,
     regime: DashboardRegime,
     price_points: Vec<DashboardPricePoint>,
     alerts: Vec<DashboardAlert>,
     gemini_summary: DashboardGeminiSummary,
     similar_windows: Vec<DashboardSimilarWindow>,
+    regime_indicators: Vec<DashboardRegimeIndicator>,
     validation: DashboardValidation,
 }
 
@@ -2454,6 +2650,14 @@ pub struct DashboardRegime {
     state: &'static str,
     confidence: &'static str,
     updated_at_ms: i64,
+    description: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DashboardMarket {
+    slug: String,
+    series: String,
+    title: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -2475,18 +2679,30 @@ pub struct DashboardAlert {
 pub struct DashboardGeminiSummary {
     enabled: bool,
     generated_at_ms: Option<i64>,
-    coverage: &'static str,
-    summary: &'static str,
+    next_update_at_ms: Option<i64>,
+    interval_seconds: Option<i64>,
+    coverage: String,
+    summary: String,
 }
 
 #[derive(Debug, Serialize)]
 pub struct DashboardSimilarWindow {
-    slug: &'static str,
+    slug: String,
     window_ts_ms: i64,
     score: f64,
     fair_gap: f64,
     ofi_1s: f64,
     depth_imbalance: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DashboardRegimeIndicator {
+    key: &'static str,
+    label: &'static str,
+    value: f64,
+    unit: &'static str,
+    status: &'static str,
+    description: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -2530,6 +2746,7 @@ pub fn build_router_with_agent_tool_mongodb(enabled: bool) -> Router {
             ManualExplainMode::Generate,
             gemini_throttle::GeminiCallBudget::new(),
         ),
+        live_dashboard_paths: live_dashboard_paths_from_env(),
     })
 }
 
@@ -2543,6 +2760,23 @@ pub fn build_router_with_manual_explain_config(
         gemini_throttle::GeminiCallBudget::new(),
         ManualExplainMode::DryRun,
     )
+}
+
+pub fn build_router_with_live_dashboard_paths(
+    market_path: impl AsRef<Path>,
+    reference_path: impl AsRef<Path>,
+) -> Router {
+    build_api_router_with_state(AppState {
+        agent_tool_mongodb_enabled: false,
+        manual_explain: manual_explain_runtime_from_env(
+            ManualExplainMode::Generate,
+            gemini_throttle::GeminiCallBudget::new(),
+        ),
+        live_dashboard_paths: Some(LiveDashboardPaths {
+            market_path: market_path.as_ref().to_path_buf(),
+            reference_path: reference_path.as_ref().to_path_buf(),
+        }),
+    })
 }
 
 fn build_router_with_manual_explain_runtime(
@@ -2559,6 +2793,7 @@ fn build_router_with_manual_explain_runtime(
             state: Arc::new(Mutex::new(ManualExplainState::default())),
             mode,
         },
+        live_dashboard_paths: live_dashboard_paths_from_env(),
     })
 }
 
@@ -2581,6 +2816,7 @@ fn build_api_router_with_budget(call_budget: gemini_throttle::GeminiCallBudget) 
     build_api_router_with_state(AppState {
         agent_tool_mongodb_enabled: true,
         manual_explain: manual_explain_runtime_from_env(ManualExplainMode::Generate, call_budget),
+        live_dashboard_paths: live_dashboard_paths_from_env(),
     })
 }
 
@@ -2624,6 +2860,27 @@ fn manual_explain_runtime_from_env(
     }
 }
 
+fn live_dashboard_paths_from_env() -> Option<LiveDashboardPaths> {
+    let collector_enabled = std::env::var("LIVE_COLLECTOR_ENABLED")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false);
+    let configured_path = std::env::var("LIVE_COLLECTOR_NDJSON_PATH").ok();
+    if !collector_enabled && configured_path.is_none() {
+        return None;
+    }
+
+    let base_path =
+        PathBuf::from(configured_path.unwrap_or_else(|| "data/live-fallback.ndjson".to_string()));
+    let extension = base_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("ndjson");
+    Some(LiveDashboardPaths {
+        market_path: base_path.with_extension(format!("market.{extension}")),
+        reference_path: base_path.with_extension(format!("reference.{extension}")),
+    })
+}
+
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
@@ -2632,6 +2889,9 @@ async fn health() -> Json<HealthResponse> {
 }
 
 async fn openapi_spec() -> Json<serde_json::Value> {
+    let server_url = std::env::var("SERVICE_PUBLIC_URL").unwrap_or_else(|_| {
+        "https://regime-sentinel-agent-998092298764.asia-northeast3.run.app".to_string()
+    });
     Json(serde_json::json!({
         "openapi": "3.0.3",
         "info": {
@@ -2640,7 +2900,7 @@ async fn openapi_spec() -> Json<serde_json::Value> {
         },
         "servers": [
             {
-                "url": "https://regime-sentinel-agent-998092298764.asia-northeast1.run.app"
+                "url": server_url
             }
         ],
         "paths": {
@@ -2915,11 +3175,14 @@ async fn openapi_spec() -> Json<serde_json::Value> {
                 },
                 "DashboardSnapshot": {
                     "type": "object",
-                    "required": ["mode", "regime", "price_points", "alerts", "gemini_summary", "similar_windows", "validation"],
+                    "required": ["mode", "market", "regime", "price_points", "alerts", "gemini_summary", "similar_windows", "regime_indicators", "validation"],
                     "properties": {
                         "mode": {
                             "type": "string",
                             "enum": ["live", "replay"]
+                        },
+                        "market": {
+                            "$ref": "#/components/schemas/DashboardMarket"
                         },
                         "regime": {
                             "$ref": "#/components/schemas/DashboardRegime"
@@ -2945,6 +3208,12 @@ async fn openapi_spec() -> Json<serde_json::Value> {
                                 "$ref": "#/components/schemas/DashboardSimilarWindow"
                             }
                         },
+                        "regime_indicators": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/components/schemas/DashboardRegimeIndicator"
+                            }
+                        },
                         "validation": {
                             "$ref": "#/components/schemas/DashboardValidation"
                         }
@@ -2952,7 +3221,7 @@ async fn openapi_spec() -> Json<serde_json::Value> {
                 },
                 "DashboardRegime": {
                     "type": "object",
-                    "required": ["state", "confidence", "updated_at_ms"],
+                    "required": ["state", "confidence", "updated_at_ms", "description"],
                     "properties": {
                         "state": {
                             "type": "string"
@@ -2963,6 +3232,24 @@ async fn openapi_spec() -> Json<serde_json::Value> {
                         "updated_at_ms": {
                             "type": "integer",
                             "format": "int64"
+                        },
+                        "description": {
+                            "type": "string"
+                        }
+                    }
+                },
+                "DashboardMarket": {
+                    "type": "object",
+                    "required": ["slug", "series", "title"],
+                    "properties": {
+                        "slug": {
+                            "type": "string"
+                        },
+                        "series": {
+                            "type": "string"
+                        },
+                        "title": {
+                            "type": "string"
                         }
                     }
                 },
@@ -3007,12 +3294,22 @@ async fn openapi_spec() -> Json<serde_json::Value> {
                 },
                 "DashboardGeminiSummary": {
                     "type": "object",
-                    "required": ["enabled", "generated_at_ms", "coverage", "summary"],
+                    "required": ["enabled", "generated_at_ms", "next_update_at_ms", "interval_seconds", "coverage", "summary"],
                     "properties": {
                         "enabled": {
                             "type": "boolean"
                         },
                         "generated_at_ms": {
+                            "type": "integer",
+                            "format": "int64",
+                            "nullable": true
+                        },
+                        "next_update_at_ms": {
+                            "type": "integer",
+                            "format": "int64",
+                            "nullable": true
+                        },
+                        "interval_seconds": {
                             "type": "integer",
                             "format": "int64",
                             "nullable": true
@@ -3051,6 +3348,31 @@ async fn openapi_spec() -> Json<serde_json::Value> {
                         "depth_imbalance": {
                             "type": "number",
                             "format": "double"
+                        }
+                    }
+                },
+                "DashboardRegimeIndicator": {
+                    "type": "object",
+                    "required": ["key", "label", "value", "unit", "status", "description"],
+                    "properties": {
+                        "key": {
+                            "type": "string"
+                        },
+                        "label": {
+                            "type": "string"
+                        },
+                        "value": {
+                            "type": "number",
+                            "format": "double"
+                        },
+                        "unit": {
+                            "type": "string"
+                        },
+                        "status": {
+                            "type": "string"
+                        },
+                        "description": {
+                            "type": "string"
                         }
                     }
                 },
@@ -3369,25 +3691,44 @@ async fn openapi_spec() -> Json<serde_json::Value> {
 }
 
 async fn dashboard_snapshot(
+    State(state): State<AppState>,
     Query(query): Query<DashboardSnapshotQuery>,
 ) -> Json<DashboardSnapshot> {
-    Json(sample_dashboard_snapshot(dashboard_mode(
-        query.mode.as_deref(),
-    )))
+    let mode = dashboard_mode(query.mode.as_deref());
+    let mut snapshot = dashboard_snapshot_for_state(&state, mode);
+    if let Some(summary) = cached_dashboard_gemini_summary(&state).await {
+        snapshot.gemini_summary = summary;
+    }
+    Json(snapshot)
 }
 
-async fn dashboard_events() -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+async fn dashboard_events(
+    State(state): State<AppState>,
+) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
     let stream = stream::unfold(
-        tokio::time::interval(Duration::from_secs(1)),
-        |mut interval| async {
+        (tokio::time::interval(Duration::from_secs(1)), state),
+        |(mut interval, state)| async {
             interval.tick().await;
-            let data = serde_json::to_string(&sample_dashboard_snapshot("live"))
+            let data = serde_json::to_string(&dashboard_snapshot_for_state(&state, "live"))
                 .expect("dashboard snapshot serializes");
-            Some((Ok(Event::default().event("snapshot").data(data)), interval))
+            Some((
+                Ok(Event::default().event("snapshot").data(data)),
+                (interval, state),
+            ))
         },
     );
 
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+fn dashboard_snapshot_for_state(state: &AppState, mode: &str) -> DashboardSnapshot {
+    state
+        .live_dashboard_paths
+        .as_ref()
+        .and_then(|paths| {
+            live_dashboard_snapshot(mode, paths, state.manual_explain.throttle.enabled)
+        })
+        .unwrap_or_else(|| sample_dashboard_snapshot(mode))
 }
 
 fn dashboard_mode(mode: Option<&str>) -> &'static str {
@@ -3397,13 +3738,451 @@ fn dashboard_mode(mode: Option<&str>) -> &'static str {
     }
 }
 
+async fn cached_dashboard_gemini_summary(state: &AppState) -> Option<DashboardGeminiSummary> {
+    let store = agent_tool_mongo_store(state).await?;
+    let summary = match store.latest_agent_summary().await {
+        Ok(Some(summary)) => summary,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::warn!(?error, "read dashboard Gemini summary from MongoDB failed");
+            return None;
+        }
+    };
+
+    dashboard_gemini_summary_from_document(&summary, state.manual_explain.throttle.enabled)
+}
+
+fn dashboard_gemini_summary_from_document(
+    summary: &mongodb::bson::Document,
+    enabled: bool,
+) -> Option<DashboardGeminiSummary> {
+    let bucket_start_ms = summary
+        .get_datetime("bucket_start")
+        .ok()
+        .map(|value| value.timestamp_millis())?;
+    let interval_seconds = summary
+        .get_i32("bucket_seconds")
+        .ok()
+        .map(i64::from)
+        .unwrap_or(1_800);
+    let text = summary.get_str("summary").ok()?.to_string();
+
+    Some(DashboardGeminiSummary {
+        enabled,
+        generated_at_ms: Some(bucket_start_ms),
+        next_update_at_ms: next_gemini_update_at_ms(Some(bucket_start_ms), interval_seconds),
+        interval_seconds: Some(interval_seconds),
+        coverage: format!("last {} minutes", interval_seconds / 60),
+        summary: text,
+    })
+}
+
+fn live_dashboard_snapshot(
+    mode: &str,
+    paths: &LiveDashboardPaths,
+    gemini_enabled: bool,
+) -> Option<DashboardSnapshot> {
+    let mut ticks = recent_market_ticks_from_ndjson(&paths.market_path, 20_000);
+    ticks.extend(recent_market_ticks_from_ndjson(&paths.reference_path, 500));
+    if ticks.is_empty() {
+        return None;
+    }
+
+    ticks.sort_by_key(|tick| tick.timestamp_ms);
+    let latest_ts = ticks
+        .iter()
+        .map(|tick| tick.timestamp_ms)
+        .max()
+        .unwrap_or_else(unix_timestamp_ms);
+    let slug = ticks
+        .iter()
+        .rev()
+        .find(|tick| tick.meta.source == "clob")
+        .or_else(|| ticks.last())
+        .map(|tick| tick.meta.slug.clone())
+        .unwrap_or_else(|| "live".to_string());
+    let series = ticks
+        .iter()
+        .rev()
+        .find(|tick| tick.meta.source == "clob")
+        .or_else(|| ticks.last())
+        .map(|tick| tick.meta.series.clone())
+        .unwrap_or_else(|| "live".to_string());
+
+    let mut up_points = ticks
+        .iter()
+        .filter(|tick| {
+            tick.meta.source == "clob"
+                && is_up_outcome(&tick.outcome)
+                && is_midpoint_tick(&tick.side)
+        })
+        .map(|tick| DashboardPricePoint {
+            timestamp_ms: tick.timestamp_ms,
+            p_mid: tick.price,
+            p_fair: 0.5,
+        })
+        .collect::<Vec<_>>();
+    if up_points.is_empty() {
+        up_points = ticks
+            .iter()
+            .filter(|tick| tick.meta.source == "clob" && is_up_outcome(&tick.outcome))
+            .map(|tick| DashboardPricePoint {
+                timestamp_ms: tick.timestamp_ms,
+                p_mid: tick.price,
+                p_fair: 0.5,
+            })
+            .collect::<Vec<_>>();
+    }
+    up_points.sort_by_key(|point| point.timestamp_ms);
+    up_points.dedup_by_key(|point| point.timestamp_ms);
+
+    if up_points.is_empty() {
+        let latest_reference = ticks
+            .iter()
+            .rev()
+            .find(|tick| tick.meta.source == "chainlink")?;
+        up_points.push(DashboardPricePoint {
+            timestamp_ms: latest_reference.timestamp_ms,
+            p_mid: latest_reference.price,
+            p_fair: latest_reference.price,
+        });
+    }
+    if up_points.len() > 120 {
+        up_points = up_points.split_off(up_points.len() - 120);
+    }
+
+    let latest_up = up_points.last().map(|point| point.p_mid).unwrap_or(0.0);
+    let fair_gap = latest_up - 0.5;
+    let mid_velocity_1s = point_velocity(&up_points, 1_000);
+    let mid_velocity_5s = point_velocity(&up_points, 5_000);
+    let order_flow_1s = order_flow_imbalance(&ticks, latest_ts, 1_000);
+    let reference_velocity_1s = reference_velocity(&ticks, 1_000);
+    let shift_score = live_shift_score(
+        fair_gap,
+        mid_velocity_1s,
+        order_flow_1s,
+        reference_velocity_1s,
+    );
+    let (regime_state, regime_description) =
+        live_regime_description(latest_up, mid_velocity_1s, order_flow_1s, shift_score);
+    let market_tick_count = ticks
+        .iter()
+        .filter(|tick| tick.meta.source == "clob")
+        .count();
+    let reference_tick_count = ticks
+        .iter()
+        .filter(|tick| tick.meta.source == "chainlink")
+        .count();
+
+    Some(DashboardSnapshot {
+        mode: mode.to_string(),
+        market: DashboardMarket {
+            slug: slug.clone(),
+            series,
+            title: std::env::var("LIVE_MARKET_TITLE").unwrap_or_else(|_| slug.clone()),
+        },
+        regime: DashboardRegime {
+            state: regime_state,
+            confidence: if latest_ts + 5_000 >= unix_timestamp_ms() {
+                "Normal"
+            } else {
+                "Low"
+            },
+            updated_at_ms: latest_ts,
+            description: regime_description,
+        },
+        price_points: up_points,
+        alerts: Vec::new(),
+        gemini_summary: DashboardGeminiSummary {
+            enabled: gemini_enabled,
+            generated_at_ms: Some(latest_ts),
+            next_update_at_ms: next_gemini_update_at_ms(Some(latest_ts), 1_800),
+            interval_seconds: Some(1_800),
+            coverage: "live collector".to_string(),
+            summary: "Live collector view: chart uses Polymarket Up midpoint ticks when available; the dashed fair line is neutral until live strike/start-price fair-probability is wired in.".to_string(),
+        },
+        similar_windows: vec![DashboardSimilarWindow {
+            slug,
+            window_ts_ms: latest_ts,
+            score: 1.0,
+            fair_gap,
+            ofi_1s: market_tick_count as f64,
+            depth_imbalance: reference_tick_count as f64,
+        }],
+        regime_indicators: vec![
+            DashboardRegimeIndicator {
+                key: "fair_gap",
+                label: "Fair gap",
+                value: fair_gap,
+                unit: "pp",
+                status: indicator_status(fair_gap.abs(), 0.03, 0.08),
+                description: "Up midpoint minus the neutral fair line; positive values mean the market is pricing Up above neutral.",
+            },
+            DashboardRegimeIndicator {
+                key: "mid_velocity_1s",
+                label: "Mid velocity 1s",
+                value: mid_velocity_1s,
+                unit: "pp/s",
+                status: indicator_status(mid_velocity_1s.abs(), 0.02, 0.07),
+                description: "One-second change rate of the Polymarket Up midpoint.",
+            },
+            DashboardRegimeIndicator {
+                key: "order_flow_1s",
+                label: "Order flow 1s",
+                value: order_flow_1s,
+                unit: "",
+                status: indicator_status(order_flow_1s.abs(), 0.25, 0.60),
+                description: "Signed one-second flow proxy: Up buys and Down sells are positive; Up sells and Down buys are negative.",
+            },
+            DashboardRegimeIndicator {
+                key: "btc_velocity_1s",
+                label: "BTC velocity 1s",
+                value: reference_velocity_1s,
+                unit: "$/s",
+                status: indicator_status(reference_velocity_1s.abs(), 20.0, 75.0),
+                description: "One-second Chainlink BTC/USD reference price velocity.",
+            },
+            DashboardRegimeIndicator {
+                key: "shift_score",
+                label: "Shift score",
+                value: shift_score,
+                unit: "",
+                status: shift_score_status(shift_score),
+                description: "Combined live heuristic from fair gap, midpoint velocity, order flow, and BTC reference velocity.",
+            },
+            DashboardRegimeIndicator {
+                key: "mid_velocity_5s",
+                label: "Mid velocity 5s",
+                value: mid_velocity_5s,
+                unit: "pp/s",
+                status: indicator_status(mid_velocity_5s.abs(), 0.01, 0.04),
+                description: "Five-second normalized change rate of the Polymarket Up midpoint.",
+            },
+        ],
+        validation: DashboardValidation {
+            median_lead_time_ms: None,
+            p75_lead_time_ms: None,
+            precision: 0.0,
+            recall: 0.0,
+            degraded_confidence: true,
+            reason: "Live collector is running; replay validation remains the acceptance source for forecast metrics.",
+            horizons: vec![
+                DashboardValidationHorizon {
+                    horizon_ms: 1_000,
+                    pr_auc: 0.0,
+                },
+                DashboardValidationHorizon {
+                    horizon_ms: 5_000,
+                    pr_auc: 0.0,
+                },
+                DashboardValidationHorizon {
+                    horizon_ms: 30_000,
+                    pr_auc: 0.0,
+                },
+            ],
+        },
+    })
+}
+
+fn recent_market_ticks_from_ndjson(path: &Path, limit: usize) -> Vec<MarketTickRecord> {
+    let Ok(file) = File::open(path) else {
+        return Vec::new();
+    };
+    let mut ticks = VecDeque::with_capacity(limit);
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if value.get("kind").and_then(serde_json::Value::as_str) != Some("market_tick") {
+            continue;
+        }
+        let Ok(tick) = serde_json::from_value::<MarketTickRecord>(value["record"].clone()) else {
+            continue;
+        };
+        if ticks.len() == limit {
+            ticks.pop_front();
+        }
+        ticks.push_back(tick);
+    }
+    ticks.into_iter().collect()
+}
+
+fn point_velocity(points: &[DashboardPricePoint], horizon_ms: i64) -> f64 {
+    let Some(latest) = points.last() else {
+        return 0.0;
+    };
+    let target_ts = latest.timestamp_ms.saturating_sub(horizon_ms);
+    let previous = points
+        .iter()
+        .rev()
+        .find(|point| point.timestamp_ms <= target_ts)
+        .or_else(|| points.first());
+    let Some(previous) = previous else {
+        return 0.0;
+    };
+    let elapsed_seconds = (latest.timestamp_ms - previous.timestamp_ms) as f64 / 1_000.0;
+    if elapsed_seconds <= 0.0 {
+        return 0.0;
+    }
+    (latest.p_mid - previous.p_mid) / elapsed_seconds
+}
+
+fn order_flow_imbalance(ticks: &[MarketTickRecord], latest_ts: i64, window_ms: i64) -> f64 {
+    let start_ts = latest_ts.saturating_sub(window_ms);
+    let mut signed_size = 0.0;
+    let mut total_size = 0.0;
+
+    for tick in ticks.iter().filter(|tick| {
+        tick.meta.source == "clob"
+            && tick.timestamp_ms >= start_ts
+            && tick.timestamp_ms <= latest_ts
+            && tick.size > 0.0
+    }) {
+        let sign = match (is_up_outcome(&tick.outcome), tick.side.as_str()) {
+            (true, "BUY") | (false, "SELL") => 1.0,
+            (true, "SELL") | (false, "BUY") => -1.0,
+            _ => 0.0,
+        };
+        if sign == 0.0 {
+            continue;
+        }
+        signed_size += sign * tick.size;
+        total_size += tick.size;
+    }
+
+    if total_size == 0.0 {
+        0.0
+    } else {
+        (signed_size / total_size).clamp(-1.0, 1.0)
+    }
+}
+
+fn reference_velocity(ticks: &[MarketTickRecord], horizon_ms: i64) -> f64 {
+    let reference_ticks = ticks
+        .iter()
+        .filter(|tick| tick.meta.source == "chainlink")
+        .collect::<Vec<_>>();
+    let Some(latest) = reference_ticks.last() else {
+        return 0.0;
+    };
+    let target_ts = latest.timestamp_ms.saturating_sub(horizon_ms);
+    let previous = reference_ticks
+        .iter()
+        .rev()
+        .find(|tick| tick.timestamp_ms <= target_ts)
+        .or_else(|| reference_ticks.first());
+    let Some(previous) = previous else {
+        return 0.0;
+    };
+    let elapsed_seconds = (latest.timestamp_ms - previous.timestamp_ms) as f64 / 1_000.0;
+    if elapsed_seconds <= 0.0 {
+        return 0.0;
+    }
+    (latest.price - previous.price) / elapsed_seconds
+}
+
+fn live_shift_score(
+    fair_gap: f64,
+    mid_velocity_1s: f64,
+    order_flow_1s: f64,
+    reference_velocity_1s: f64,
+) -> f64 {
+    (fair_gap.abs() * 2.0
+        + mid_velocity_1s.abs() * 4.0
+        + order_flow_1s.abs() * 0.4
+        + (reference_velocity_1s.abs() / 100.0).min(0.3))
+    .clamp(0.0, 1.0)
+}
+
+fn live_regime_description(
+    latest_up: f64,
+    mid_velocity_1s: f64,
+    order_flow_1s: f64,
+    shift_score: f64,
+) -> (&'static str, String) {
+    if shift_score >= 0.75 {
+        let side = if latest_up >= 0.5 {
+            "Up-side"
+        } else {
+            "Down-side"
+        };
+        return (
+            "SHIFT_RISK",
+            format!(
+                "{side} shift risk: midpoint, short-horizon velocity, and signed flow are moving together; this is a live heuristic, not yet a validated forecast."
+            ),
+        );
+    }
+
+    if latest_up >= 0.56 || (mid_velocity_1s > 0.02 && order_flow_1s > 0.20) {
+        return (
+            "UP_PRESSURE",
+            "Up-side pressure: the Up midpoint is above neutral or recent flow is leaning toward Up."
+                .to_string(),
+        );
+    }
+
+    if latest_up <= 0.44 || (mid_velocity_1s < -0.02 && order_flow_1s < -0.20) {
+        return (
+            "DOWN_PRESSURE",
+            "Down-side pressure: the Up midpoint is below neutral or recent flow is leaning toward Down."
+                .to_string(),
+        );
+    }
+
+    (
+        "BALANCED_LIVE",
+        "Balanced live regime: midpoint and short-horizon flow are near neutral; continue watching for velocity and flow alignment.".to_string(),
+    )
+}
+
+fn indicator_status(value: f64, elevated_threshold: f64, high_threshold: f64) -> &'static str {
+    if value >= high_threshold {
+        "high"
+    } else if value >= elevated_threshold {
+        "elevated"
+    } else {
+        "normal"
+    }
+}
+
+fn shift_score_status(score: f64) -> &'static str {
+    if score >= 0.75 {
+        "high"
+    } else if score >= 0.45 {
+        "watch"
+    } else {
+        "normal"
+    }
+}
+
+fn is_up_outcome(outcome: &str) -> bool {
+    matches!(outcome, "UP" | "Up" | "YES" | "Yes")
+}
+
+fn is_midpoint_tick(side: &str) -> bool {
+    matches!(side, "BBA" | "BOOK")
+}
+
+fn next_gemini_update_at_ms(generated_at_ms: Option<i64>, interval_seconds: i64) -> Option<i64> {
+    generated_at_ms.map(|generated_at_ms| generated_at_ms + interval_seconds * 1_000)
+}
+
 fn sample_dashboard_snapshot(mode: &str) -> DashboardSnapshot {
     DashboardSnapshot {
         mode: mode.to_string(),
+        market: DashboardMarket {
+            slug: "btc-updown-5m-1768999700".to_string(),
+            series: "btc-updown-5m".to_string(),
+            title: "Bitcoin Up or Down - demo replay".to_string(),
+        },
         regime: DashboardRegime {
             state: "EARLY_RISK",
             confidence: "Normal",
             updated_at_ms: 1_769_000_000_750,
+            description:
+                "Demo replay regime: Up-side pressure increased before the generated alert marker."
+                    .to_string(),
         },
         price_points: vec![
             DashboardPricePoint {
@@ -3431,17 +4210,53 @@ fn sample_dashboard_snapshot(mode: &str) -> DashboardSnapshot {
         gemini_summary: DashboardGeminiSummary {
             enabled: true,
             generated_at_ms: Some(1_769_000_001_000),
-            coverage: "last 30 minutes",
-            summary: "Cached demo summary: early risk increased because fair-gap velocity, order flow, and depth imbalance moved in the same direction.",
+            next_update_at_ms: next_gemini_update_at_ms(Some(1_769_000_001_000), 1_800),
+            interval_seconds: Some(1_800),
+            coverage: "last 30 minutes".to_string(),
+            summary: "Cached demo summary: early risk increased because fair-gap velocity, order flow, and depth imbalance moved in the same direction.".to_string(),
         },
         similar_windows: vec![DashboardSimilarWindow {
-            slug: "btc-updown-5m-1768999700",
+            slug: "btc-updown-5m-1768999700".to_string(),
             window_ts_ms: 1_768_999_700_750,
             score: 0.98,
             fair_gap: 0.05,
             ofi_1s: 0.42,
             depth_imbalance: 0.31,
         }],
+        regime_indicators: vec![
+            DashboardRegimeIndicator {
+                key: "fair_gap",
+                label: "Fair gap",
+                value: 0.05,
+                unit: "pp",
+                status: "elevated",
+                description: "Demo fair probability gap used by the replay alert.",
+            },
+            DashboardRegimeIndicator {
+                key: "mid_velocity_1s",
+                label: "Mid velocity 1s",
+                value: 0.08,
+                unit: "pp/s",
+                status: "high",
+                description: "Demo one-second midpoint repricing velocity.",
+            },
+            DashboardRegimeIndicator {
+                key: "order_flow_1s",
+                label: "Order flow 1s",
+                value: 0.42,
+                unit: "",
+                status: "elevated",
+                description: "Demo signed flow proxy used by the replay alert.",
+            },
+            DashboardRegimeIndicator {
+                key: "shift_score",
+                label: "Shift score",
+                value: 0.82,
+                unit: "",
+                status: "high",
+                description: "Demo combined regime-shift heuristic score.",
+            },
+        ],
         validation: DashboardValidation {
             median_lead_time_ms: Some(250),
             p75_lead_time_ms: Some(250),

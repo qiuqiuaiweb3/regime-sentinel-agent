@@ -14,7 +14,7 @@ experience.
 Current implementation status:
 
 - Rust workspace with `regime-core`, `regime-service`, and `regime-replay`.
-- Google Cloud defaults target `asia-northeast1`.
+- Google Cloud defaults target Seoul `asia-northeast3`.
 - MongoDB and Gemini configuration are provided through environment variables.
 - MongoDB MCP read-only integration is documented in `docs/mongodb-mcp.md`, with
   a checked-in client config template under `mcp/`.
@@ -28,7 +28,7 @@ Current implementation status:
 - MongoDB document writers exist for market ticks, feature windows, regime states, alerts,
   agent summaries, and backtest runs.
 - Axum serves the SvelteKit dashboard, REST API, SSE stream, and OpenAPI tool spec.
-- Live collector code supports Polymarket CLOB market data, Coinbase BTC reference prices,
+- Live collector code supports Polymarket CLOB market data, Chainlink BTC/USD reference prices,
   stale-data downgrade, and NDJSON fallback.
 - Gemini calls are disabled by default and cost-limited when enabled.
 - Agent Builder read tools expose current regime, recent alerts, similar windows,
@@ -87,13 +87,13 @@ Required later for live/cloud runs:
 - `GEMINI_MANUAL_COOLDOWN_SECONDS`
 - `MDB_MCP_CONNECTION_STRING`
 
-Gemini is intentionally disabled by default. The default provider is Vertex AI.
+Gemini is intentionally disabled locally by default. The default provider is Vertex AI.
 For a local one-off summary, set:
 
 ```bash
 GEMINI_ENABLED=true
 GEMINI_PROVIDER=vertex
-GEMINI_LOCATION=global
+GEMINI_LOCATION=asia-northeast3
 GEMINI_MODEL=gemini-3-flash-preview
 GEMINI_ACCESS_TOKEN="$(gcloud auth print-access-token)"
 GEMINI_SUMMARY_INTERVAL_MINUTES=30
@@ -114,7 +114,7 @@ LIVE_MARKET_SLUG=btc-updown-5m-...
 LIVE_MARKET_SERIES=btc-updown-5m
 POLYMARKET_ASSET_IDS=yes-token-id,no-token-id
 POLYMARKET_OUTCOMES=UP,DOWN
-REFERENCE_PRICE_PRODUCT_ID=BTC-USD
+REFERENCE_PRICE_SYMBOL=btc/usd
 ```
 
 ## Run Locally
@@ -137,7 +137,6 @@ Useful local endpoints:
 - `http://127.0.0.1:8080/api/agent/recent-alerts`
 - `http://127.0.0.1:8080/api/agent/backtest-metrics`
 - `http://127.0.0.1:8080/api/agent/market-summary`
-- `http://127.0.0.1:8080/api/agent/explain-now`
 - `http://127.0.0.1:8080/api/openapi.json`
 
 ## MongoDB MCP
@@ -224,21 +223,24 @@ The checked-in latency artifact is `demo/reports/latency-probe-report.json`.
 
 ## Google Cloud Run
 
-The deployment target is Tokyo:
+The deployment target is Seoul:
 
 ```bash
 gcloud config set project poly-market-analysis
-gcloud builds submit --config cloudbuild.yaml
+gcloud config set compute/region asia-northeast3
+gcloud config set run/region asia-northeast3
+gcloud builds submit --region asia-northeast3 --config cloudbuild.yaml
 ```
 
 The Cloud Build file creates an Artifact Registry Docker repository in
-`asia-northeast1`, builds the SvelteKit static frontend and Rust service image,
+`asia-northeast3`, builds the SvelteKit static frontend and Rust service image,
 pushes the image, and deploys Cloud Run with `LIVE_COLLECTOR_ENABLED=false` and
-`GEMINI_ENABLED=false`.
+`GEMINI_ENABLED=true`. Scheduled Gemini summaries run every 30 minutes and
+replace the previous cached response in `agent_summaries`.
 
 Cloud Run resource settings are explicit in `cloudbuild.yaml`:
 
-- region: `asia-northeast1`
+- region: `asia-northeast3`
 - service account: `998092298764-compute@developer.gserviceaccount.com`
 - CPU / memory: `1` vCPU / `1Gi`
 - instances: min `1`, max `1`
@@ -249,7 +251,7 @@ Cloud Run resource settings are explicit in `cloudbuild.yaml`:
 Current hosted URL:
 
 ```text
-https://regime-sentinel-agent-998092298764.asia-northeast1.run.app
+https://regime-sentinel-agent-998092298764.asia-northeast3.run.app
 ```
 
 One-time IAM grants used by the deployed service:
@@ -267,7 +269,7 @@ gcloud secrets add-iam-policy-binding mongodb-db \
   --role='roles/secretmanager.secretAccessor'
 
 gcloud beta run services add-iam-policy-binding regime-sentinel-agent \
-  --region asia-northeast1 \
+  --region asia-northeast3 \
   --member=allUsers \
   --role=roles/run.invoker
 ```
@@ -281,7 +283,7 @@ Optional Gemini secret/env can be added later after a real API key is available:
 
 ```bash
 gcloud run services update regime-sentinel-agent \
-  --region asia-northeast1 \
+  --region asia-northeast3 \
   --set-env-vars GEMINI_ENABLED=true,GEMINI_SUMMARY_INTERVAL_MINUTES=30,GEMINI_MAX_CALLS_PER_HOUR=2 \
   --set-secrets GEMINI_API_KEY=gemini-api-key:latest
 ```
@@ -291,7 +293,7 @@ gcloud run services update regime-sentinel-agent \
 The deployed OpenAPI spec is served from:
 
 ```text
-https://regime-sentinel-agent-998092298764.asia-northeast1.run.app/api/openapi.json
+https://regime-sentinel-agent-998092298764.asia-northeast3.run.app/api/openapi.json
 ```
 
 It exposes read/demo-safe operations for health, dashboard snapshot, replay
@@ -301,24 +303,52 @@ Cloud Run server URL, and declares the replay validation JSON request body.
 
 Configured Google Cloud resources:
 
-- agent:
-  `projects/poly-market-analysis/locations/asia-northeast1/agents/3e5926c5-ed12-40de-a944-b66fae7fe1e0`
-- OpenAPI tool:
-  `projects/poly-market-analysis/locations/asia-northeast1/agents/3e5926c5-ed12-40de-a944-b66fae7fe1e0/tools/83dd74d9-d114-433d-b46d-6dd4a055bc48`
-- playbook:
-  `projects/poly-market-analysis/locations/asia-northeast1/agents/3e5926c5-ed12-40de-a944-b66fae7fe1e0/playbooks/c186ebd4-adcb-4ea6-b400-893768e30ff4`
+- Agent Builder resources should be created in `asia-northeast3`; Tokyo
+  `asia-northeast1` Agent Builder resources are no longer the target.
 
 ## Live Smoke
 
 Run the GCP-network live smoke from Cloud Build:
 
 ```bash
-gcloud builds submit --config cloudbuild.live-smoke.yaml
+gcloud builds submit --region asia-northeast3 --config cloudbuild.live-smoke.yaml
 ```
 
 The smoke discovers three current `btc-updown-5m-{epoch}` events, subscribes to
-their Polymarket CLOB market streams plus Coinbase `BTC-USD`, and writes JSON
-artifacts to `gs://poly-market-analysis_cloudbuild/live-smoke/$BUILD_ID/`.
+their Polymarket CLOB market streams plus Chainlink `btc/usd`, and writes JSON
+artifacts to `gs://poly-market-analysis-asia-northeast3-cloudbuild/live-smoke/$BUILD_ID/`.
+
+Run the four-hour Seoul-network collection volume soak from Cloud Build:
+
+```bash
+MONGODB_URI='...' MONGODB_DB=regime_sentinel \
+  cargo run -q -p regime-service --bin mongodb_storage_report \
+  > /tmp/regime-storage-before.json
+
+gcloud builds submit --region asia-northeast3 --config cloudbuild.live-soak.yaml
+
+MONGODB_URI='...' MONGODB_DB=regime_sentinel \
+  cargo run -q -p regime-service --bin mongodb_storage_report \
+  > /tmp/regime-storage-after.json
+```
+
+The soak rotates through active BTC 5 minute markets, records Polymarket CLOB
+ticks plus Chainlink `btc/usd`, and keeps only the most recent 12 market windows
+locally before uploading to:
+
+```text
+gs://poly-market-analysis-asia-northeast3-cloudbuild/live-soak/latest/
+```
+
+`summary.json` reports duration, market ticks, reference ticks, stale states,
+and NDJSON bytes for the retained one-hour window only.
+The `mongodb_storage_report` before/after files provide the MongoDB Atlas
+`dataSize`, `storageSize`, index size, and collection counts. MongoDB ingest is
+disabled by default for the soak because the raw CLOB tick rate can overload the
+512MB Atlas tier; use `_INGEST_MONGODB=true` only for a deliberately bounded test.
+When ingest is enabled, `ROLLING_MARKET_LIMIT` defaults to 12 and old market
+slugs are deleted from `market_ticks`, `feature_windows`, `alerts`, and
+`regime_states` after each completed market window.
 
 Latest passing run:
 

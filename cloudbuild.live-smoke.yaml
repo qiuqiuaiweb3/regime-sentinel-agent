@@ -79,9 +79,10 @@ timeout: 1800s
 
 substitutions:
   _LIVE_SMOKE_DURATION_SECONDS: '30'
+  _ARTIFACT_BUCKET: poly-market-analysis-asia-northeast3-cloudbuild
 
 artifacts:
   objects:
-    location: gs://poly-market-analysis_cloudbuild/live-smoke/$BUILD_ID
+    location: gs://${_ARTIFACT_BUCKET}/live-smoke/$BUILD_ID
     paths:
       - /workspace/live-smoke/*

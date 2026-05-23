@@ -15,6 +15,7 @@ fn gemini_summary_config_defaults_to_disabled_without_api_key() {
     assert!(!config.throttle.enabled);
     assert_eq!(config.model, "gemini-3-pro-preview");
     assert_eq!(config.provider, GeminiProvider::VertexAi);
+    assert_eq!(config.location, "asia-northeast3");
     assert_eq!(config.throttle.summary_interval_minutes, 30);
 }
 
@@ -75,6 +76,65 @@ fn vertex_request_can_defer_auth_to_metadata_token() {
 
     assert_eq!(request.auth, None);
     assert!(request.url.contains("aiplatform.googleapis.com"));
+}
+
+#[test]
+fn gemini_3_regional_location_uses_global_vertex_host() {
+    let config = GeminiSummaryConfig::from_env_values(
+        Some("true"),
+        Some("15"),
+        Some("2"),
+        None,
+        None,
+        Some("gemini-3-flash-preview"),
+        None,
+        Some("vertex"),
+        Some("poly-market-analysis"),
+        Some("asia-northeast3"),
+        Some("test-token"),
+    )
+    .expect("gemini config");
+
+    let request = build_gemini_request(&config, "hello").expect("request");
+
+    assert_eq!(
+        request.url,
+        "https://aiplatform.googleapis.com/v1/projects/poly-market-analysis/locations/asia-northeast3/publishers/google/models/gemini-3-flash-preview:generateContent"
+    );
+    assert_eq!(
+        request.body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "LOW"
+    );
+}
+
+#[test]
+fn gemini_25_request_omits_unsupported_thinking_level() {
+    let config = GeminiSummaryConfig::from_env_values(
+        Some("true"),
+        Some("15"),
+        Some("2"),
+        None,
+        None,
+        Some("gemini-2.5-flash"),
+        None,
+        Some("vertex"),
+        Some("poly-market-analysis"),
+        Some("asia-northeast3"),
+        Some("test-token"),
+    )
+    .expect("gemini config");
+
+    let request = build_gemini_request(&config, "hello").expect("request");
+
+    assert_eq!(
+        request.url,
+        "https://asia-northeast3-aiplatform.googleapis.com/v1/projects/poly-market-analysis/locations/asia-northeast3/publishers/google/models/gemini-2.5-flash:generateContent"
+    );
+    assert!(
+        request.body["generationConfig"]
+            .get("thinkingConfig")
+            .is_none()
+    );
 }
 
 #[test]

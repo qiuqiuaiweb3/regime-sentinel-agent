@@ -203,6 +203,64 @@ fn agent_summary_insert_matches_summary_schema() {
 }
 
 #[test]
+fn agent_summary_bucket_upsert_overwrites_the_scheduled_bucket() {
+    let summary = AgentSummaryRecord {
+        bucket_start_ms: 1_769_000_000_000,
+        bucket_seconds: 1_800,
+        model: "gemini-3-flash-preview".to_string(),
+        thinking_level: "LOW".to_string(),
+        summary: "Fresh scheduled summary replaces the previous response.".to_string(),
+        alert_ids: Vec::new(),
+        similar_window_ids: Vec::new(),
+        token_usage: serde_json::json!({"estimated": true}),
+    };
+
+    let update = regime_service::mongo_documents::agent_summary_bucket_upsert(&summary);
+
+    assert_eq!(update.collection_name, "agent_summaries");
+    assert_eq!(
+        update
+            .filter
+            .get_datetime("bucket_start")
+            .map(|value| value.timestamp_millis()),
+        Ok(1_769_000_000_000)
+    );
+    assert_eq!(
+        update
+            .update
+            .get_document("$set")
+            .unwrap()
+            .get_str("summary"),
+        Ok("Fresh scheduled summary replaces the previous response.")
+    );
+    assert!(update.upsert);
+}
+
+#[test]
+fn market_data_retention_filters_delete_related_slug_data() {
+    let slugs = vec!["btc-updown-5m-1".to_string(), "btc-updown-5m-2".to_string()];
+
+    let deletes = regime_service::mongo_documents::market_data_retention_deletes(&slugs);
+
+    let collections = deletes
+        .iter()
+        .map(|delete| delete.collection_name)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        collections,
+        vec!["market_ticks", "feature_windows", "alerts", "regime_states"]
+    );
+    assert_eq!(
+        deletes[0].filter,
+        mongodb::bson::doc! { "meta.slug": { "$in": &slugs } }
+    );
+    assert_eq!(
+        deletes[3].filter,
+        mongodb::bson::doc! { "_id": { "$in": &slugs } }
+    );
+}
+
+#[test]
 fn backtest_run_insert_matches_validation_schema() {
     let run = BacktestRunRecord {
         created_at_ms: 1_769_000_000_999,

@@ -15,7 +15,7 @@ fn mongo_collection_specs_match_plan() {
                 == Some(TimeSeriesSpec {
                     time_field: "timestamp",
                     meta_field: "meta",
-                    expire_after_seconds: 604_800,
+                    expire_after_seconds: 3_600,
                 })
     }));
     assert!(

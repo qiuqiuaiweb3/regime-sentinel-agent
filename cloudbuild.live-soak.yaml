@@ -1,0 +1,189 @@
+steps:
+  - name: rust:1.95-bookworm
+    entrypoint: bash
+    secretEnv:
+      - MONGODB_URI
+      - MONGODB_DB
+    args:
+      - -lc
+      - |
+        set -euo pipefail
+
+        apt-get update
+        apt-get install -y --no-install-recommends ca-certificates cmake curl jq pkg-config
+        rm -rf /var/lib/apt/lists/*
+
+        /usr/local/cargo/bin/cargo build -q -p regime-service --bin live_smoke --bin ingest_live_ndjson
+
+        mkdir -p /workspace/live-soak/latest
+
+        prune_old_markets() {
+          declare -A seen_slugs=()
+          declare -A keep_slugs=()
+          local retained_count=0
+
+          while IFS= read -r report_name; do
+            slug=$$(jq -r '.slug // empty' "/workspace/live-soak/$${report_name}")
+            if [ -z "$${slug}" ] || [ "$${seen_slugs[$${slug}]+x}" ]; then
+              continue
+            fi
+            seen_slugs["$${slug}"]=1
+            if [ "$${retained_count}" -lt "${_MAX_RETAINED_MARKETS}" ]; then
+              keep_slugs["$${slug}"]=1
+              retained_count=$$((retained_count + 1))
+            fi
+          done < <(find /workspace/live-soak -maxdepth 1 -type f \
+            -name '[0-9]*-btc-updown-5m-*.report.json' \
+            -printf '%f\n' | sort -t- -k1,1nr)
+
+          while IFS= read -r report; do
+            slug=$$(jq -r '.slug // empty' "$${report}")
+            if [ -z "$${slug}" ] || [ "$${keep_slugs[$${slug}]+x}" ]; then
+              continue
+            fi
+
+            base=$$(basename "$${report}" .report.json)
+            cycle=$${base%%-*}
+            rm -f "/workspace/live-soak/$${base}."* \
+              "/workspace/live-soak/markets-$${cycle}.json"
+          done < <(find /workspace/live-soak -maxdepth 1 -type f \
+            -name '[0-9]*-btc-updown-5m-*.report.json')
+        }
+
+        deadline_s=$$(($$(date +%s) + ${_SOAK_DURATION_SECONDS}))
+        cycle=0
+        while [ "$$(date +%s)" -lt "$${deadline_s}" ]; do
+          now_s=$$(date +%s)
+          floor_s=$$(( now_s - now_s % 300 ))
+          elapsed_s=$$(( now_s - floor_s ))
+          start_offset=0
+          if [ "$${elapsed_s}" -gt 210 ]; then
+            start_offset=300
+          fi
+
+          : > /workspace/live-soak/markets.tmp
+          for offset in "$${start_offset}" "$$(( start_offset + 300 ))" "$$(( start_offset + 600 ))"; do
+            slug="btc-updown-5m-$$(( floor_s + offset ))"
+            curl -fsS "https://gamma-api.polymarket.com/events/slug/$${slug}" \
+              | jq --arg slug "$${slug}" '
+                def arr(x):
+                  if x == null then []
+                  elif (x | type) == "array" then x
+                  elif (x | type) == "string" then (x | fromjson? // [])
+                  else []
+                  end;
+                .markets[0]
+                | {
+                      slug: $slug,
+                      title,
+                      clobTokenIds: arr(.clobTokenIds),
+                      outcomes: arr(.outcomes),
+                      active,
+                      closed
+                    }
+                | select(.active == true and .closed == false and (.clobTokenIds | length >= 2))
+              ' >> /workspace/live-soak/markets.tmp
+          done
+
+          jq -s . /workspace/live-soak/markets.tmp > /workspace/live-soak/markets-$${cycle}.json
+          market_count=$$(jq 'length' /workspace/live-soak/markets-$${cycle}.json)
+          if [ "$${market_count}" -eq 0 ]; then
+            echo "No active BTC 5m market found; retrying in 30s" >&2
+            sleep 30
+            continue
+          fi
+
+          slug=$$(jq -r '.[0].slug' /workspace/live-soak/markets-$${cycle}.json)
+          asset_ids=$$(jq -r '.[0].clobTokenIds | join(",")' /workspace/live-soak/markets-$${cycle}.json)
+          outcomes=$$(jq -r '.[0].outcomes | map(ascii_upcase) | join(",")' /workspace/live-soak/markets-$${cycle}.json)
+          remaining_s=$$(( deadline_s - $$(date +%s) ))
+          run_s=${_WINDOW_DURATION_SECONDS}
+          if [ "$${remaining_s}" -lt "$${run_s}" ]; then
+            run_s="$${remaining_s}"
+          fi
+          if [ "$${run_s}" -le 0 ]; then
+            break
+          fi
+
+          echo "Soak cycle $${cycle}: $${slug} for $${run_s}s" >&2
+          LIVE_COLLECTOR_ENABLED=true \
+          LIVE_MARKET_SLUG="$${slug}" \
+          LIVE_MARKET_SERIES=btc-updown-5m \
+          POLYMARKET_ASSET_IDS="$${asset_ids}" \
+          POLYMARKET_OUTCOMES="$${outcomes}" \
+          LIVE_COLLECTOR_NDJSON_PATH="/workspace/live-soak/$${cycle}-$${slug}.ndjson" \
+          LIVE_SMOKE_DURATION_SECONDS="$${run_s}" \
+            /workspace/target/debug/live_smoke \
+            | tee "/workspace/live-soak/$${cycle}-$${slug}.report.json"
+          if [ "${_INGEST_MONGODB}" = "true" ]; then
+            ROLLING_MARKET_LIMIT="${_MAX_RETAINED_MARKETS}" \
+              /workspace/target/debug/ingest_live_ndjson \
+              "/workspace/live-soak/$${cycle}-$${slug}.market.ndjson" \
+              "/workspace/live-soak/$${cycle}-$${slug}.reference.ndjson" \
+              | tee "/workspace/live-soak/$${cycle}-$${slug}.ingest.json"
+          else
+            jq -n '{"skipped": true, "reason": "INGEST_MONGODB disabled"}' \
+              > "/workspace/live-soak/$${cycle}-$${slug}.ingest.json"
+          fi
+          prune_old_markets
+          cycle=$$((cycle + 1))
+        done
+
+        : > /workspace/live-soak/reports.ndjson
+        for report in /workspace/live-soak/[0-9]*-btc-updown-5m-*.report.json; do
+          [ -e "$${report}" ] || continue
+          cat "$${report}" >> /workspace/live-soak/reports.ndjson
+          echo >> /workspace/live-soak/reports.ndjson
+        done
+        jq -s '
+          {
+            passed: all(.[]; .passed),
+            cycles: length,
+            duration_seconds: (map(.duration_seconds) | add // 0),
+            ndjson_bytes: (map(.ndjson_bytes) | add // 0),
+            market_ticks: (map(.market_ticks) | add // 0),
+            reference_ticks: (map(.reference_ticks) | add // 0),
+            stale_states: (map(.stale_states) | add // 0),
+            windows: .
+          }
+        ' /workspace/live-soak/[0-9]*-btc-updown-5m-*.report.json > /workspace/live-soak/summary.json
+        cat /workspace/live-soak/summary.json
+        cp /workspace/live-soak/summary.json \
+          /workspace/live-soak/reports.ndjson \
+          /workspace/live-soak/latest/
+        for report in /workspace/live-soak/[0-9]*-btc-updown-5m-*.report.json; do
+          [ -e "$${report}" ] || continue
+          base=$$(basename "$${report}" .report.json)
+          cycle=$${base%%-*}
+          cp /workspace/live-soak/"$${base}."* /workspace/live-soak/latest/
+          if [ -f "/workspace/live-soak/markets-$${cycle}.json" ]; then
+            cp "/workspace/live-soak/markets-$${cycle}.json" /workspace/live-soak/latest/
+          fi
+        done
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    args:
+      - -lc
+      - |
+        set -euo pipefail
+        if gcloud storage ls "gs://${_ARTIFACT_BUCKET}/live-soak/latest/**" >/dev/null 2>&1; then
+          gcloud storage rm --recursive "gs://${_ARTIFACT_BUCKET}/live-soak/latest"
+        fi
+        gcloud storage cp --recursive /workspace/live-soak/latest "gs://${_ARTIFACT_BUCKET}/live-soak/"
+
+timeout: 18000s
+
+substitutions:
+  _SOAK_DURATION_SECONDS: '14400'
+  _WINDOW_DURATION_SECONDS: '240'
+  _INGEST_MONGODB: 'false'
+  _MAX_RETAINED_MARKETS: '12'
+  _ARTIFACT_BUCKET: poly-market-analysis-asia-northeast3-cloudbuild
+
+availableSecrets:
+  secretManager:
+    - versionName: projects/$PROJECT_ID/secrets/mongodb-uri/versions/latest
+      env: MONGODB_URI
+    - versionName: projects/$PROJECT_ID/secrets/mongodb-db/versions/latest
+      env: MONGODB_DB

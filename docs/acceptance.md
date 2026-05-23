@@ -38,8 +38,8 @@ hosted Google Cloud infrastructure.
   - `GET /api/openapi.json`
 - SvelteKit dashboard served by Axum static fallback, with live/replay mode,
   TradingView Lightweight Charts, similar-history context, validation metrics,
-  Gemini summary coverage, and a cooldown-gated `Explain now` action.
-- Polymarket CLOB market collector core, Coinbase BTC reference collector core,
+  Gemini summary coverage, and a fixed half-hour Gemini countdown.
+- Polymarket CLOB market collector core, Chainlink BTC/USD reference collector core,
   stale-data downgrade, and NDJSON fallback.
 - Gemini summary request builder/parser/scheduler, disabled by default and gated by
   `GEMINI_ENABLED=true`, with Vertex AI as the default provider and Developer API key
@@ -55,7 +55,7 @@ hosted Google Cloud infrastructure.
   `gemini-3-flash-preview`; `gemini_summary_once` returned text and persisted it to
   MongoDB `agent_summaries`.
 - Hosted Cloud Run URL:
-  `https://regime-sentinel-agent-998092298764.asia-northeast1.run.app`
+  `https://regime-sentinel-agent-998092298764.asia-northeast3.run.app`
 - Public GitHub repository:
   `https://github.com/qiuqiuaiweb3/regime-sentinel-agent`
 - Fixed replay demo artifacts:
@@ -94,7 +94,7 @@ hosted Google Cloud infrastructure.
 - MongoDB Atlas demo write/query was verified on 2026-05-23 JST for
   `demo-1779472674857` with count `1` in each of `market_ticks`, `feature_windows`,
   `regime_states`, `alerts`, `agent_summaries`, and `backtest_runs`.
-- Cloud Run resource config is explicit in `cloudbuild.yaml`: `asia-northeast1`,
+- Cloud Run resource config is explicit in `cloudbuild.yaml`: `asia-northeast3`,
   `1` vCPU, `1Gi` memory, min `1`, max `1`, concurrency `80`, timeout `3600s`,
   service account, Secret Manager injection, and
   `AGENT_TOOL_MONGODB_TIMEOUT_MS=1500`.
@@ -145,7 +145,7 @@ hosted Google Cloud infrastructure.
     - `btc-updown-5m-1779483000`: `market_ticks=34276`, `reference_ticks=101`.
     - `btc-updown-5m-1779483300`: `market_ticks=362`, `reference_ticks=145`.
     - `btc-updown-5m-1779483600`: `market_ticks=6`, `reference_ticks=189`.
-  - Each smoke ran for `30` seconds and observed `BTC-USD`, `UP`, and `DOWN`
+  - Each smoke ran for `30` seconds and observed `btc/usd`, `UP`, and `DOWN`
     outcomes.
   - The live-smoke Cloud Build compiles `live_smoke` before market discovery and
     skips the current window when it is within the last 90 seconds, so discovered
@@ -175,7 +175,7 @@ cargo run -q -p regime-replay --bin latency-probe -- \
   --input demo/replay/latency-probe-window.json --samples 256
 cargo run -p regime-service --bin seed_demo_mongodb
 cargo run -p regime-service --bin verify_demo_mongodb
-GEMINI_ENABLED=true GEMINI_PROVIDER=vertex GEMINI_LOCATION=global \
+GEMINI_ENABLED=true GEMINI_PROVIDER=vertex GEMINI_LOCATION=asia-northeast3 \
   GEMINI_MODEL=gemini-3-flash-preview \
   GEMINI_ACCESS_TOKEN="$(gcloud auth print-access-token)" \
   cargo run -p regime-service --bin gemini_summary_once

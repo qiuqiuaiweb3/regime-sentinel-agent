@@ -1,6 +1,6 @@
 use regime_service::live_collector::{
     LiveCollectorConfig, append_ndjson_fallback, live_smoke_passed, market_ticks_from_message,
-    persist_market_tick_or_fallback, reference_tick_from_coinbase_message, stale_data_penalty,
+    persist_market_tick_or_fallback, reference_tick_from_chainlink_message, stale_data_penalty,
     stale_regime_state, summarize_live_smoke_ndjson,
 };
 use serde_json::Value;
@@ -50,7 +50,7 @@ fn live_collector_config_builds_polymarket_market_subscription() {
 }
 
 #[test]
-fn live_collector_config_builds_coinbase_reference_subscription() {
+fn live_collector_config_builds_chainlink_reference_subscription() {
     let config = LiveCollectorConfig::from_env_values(
         Some("true"),
         Some("btc-updown-5m-1769000000"),
@@ -66,9 +66,14 @@ fn live_collector_config_builds_coinbase_reference_subscription() {
     assert_eq!(
         config.reference_subscription_message(),
         serde_json::json!({
-            "type": "subscribe",
-            "product_ids": ["BTC-USD"],
-            "channels": ["ticker", "heartbeat"]
+            "action": "subscribe",
+            "subscriptions": [
+                {
+                    "topic": "crypto_prices_chainlink",
+                    "type": "*",
+                    "filters": "{\"symbol\":\"btc/usd\"}"
+                }
+            ]
         })
     );
 }
@@ -168,7 +173,7 @@ fn market_ticks_ignore_plain_websocket_heartbeats() {
 }
 
 #[test]
-fn coinbase_ticker_message_converts_to_reference_market_tick() {
+fn chainlink_update_message_converts_to_reference_market_tick() {
     let config = LiveCollectorConfig::from_env_values(
         Some("true"),
         Some("btc-updown-5m-1769000000"),
@@ -181,12 +186,16 @@ fn coinbase_ticker_message_converts_to_reference_market_tick() {
     )
     .expect("collector config");
 
-    let tick = reference_tick_from_coinbase_message(
+    let tick = reference_tick_from_chainlink_message(
         r#"{
-          "type": "ticker",
-          "product_id": "BTC-USD",
-          "price": "65000.25",
-          "time": "1970-01-01T00:00:01.250Z"
+          "topic": "crypto_prices_chainlink",
+          "type": "update",
+          "timestamp": 1500,
+          "payload": {
+            "symbol": "btc/usd",
+            "timestamp": 1250,
+            "value": 65000.25
+          }
         }"#,
         &config,
         1_500,
@@ -196,12 +205,32 @@ fn coinbase_ticker_message_converts_to_reference_market_tick() {
 
     assert_eq!(tick.timestamp_ms, 1_250);
     assert_eq!(tick.meta.slug, "btc-updown-5m-1769000000");
-    assert_eq!(tick.meta.source, "coinbase");
+    assert_eq!(tick.meta.source, "chainlink");
     assert_eq!(tick.price, 65000.25);
     assert_eq!(tick.size, 0.0);
-    assert_eq!(tick.side, "TICKER");
-    assert_eq!(tick.outcome, "BTC-USD");
+    assert_eq!(tick.side, "ORACLE");
+    assert_eq!(tick.outcome, "btc/usd");
     assert_eq!(tick.receive_lag_ms, 250);
+}
+
+#[test]
+fn chainlink_reference_ticks_ignore_plain_websocket_heartbeats() {
+    let config = LiveCollectorConfig::from_env_values(
+        Some("true"),
+        Some("btc-updown-5m-1769000000"),
+        Some("btc-updown-5m"),
+        Some("yes-token,no-token"),
+        Some("UP,DOWN"),
+        None,
+        Some("/tmp/regime-fallback.ndjson"),
+        Some("1500"),
+    )
+    .expect("collector config");
+
+    let tick =
+        reference_tick_from_chainlink_message("PONG", &config, 1_500).expect("heartbeat ignored");
+
+    assert!(tick.is_none());
 }
 
 #[test]
@@ -297,7 +326,7 @@ fn live_smoke_summary_counts_market_and_reference_ticks() {
     std::fs::write(
         &path,
         r#"{"kind":"market_tick","record":{"timestamp_ms":1769000000100,"meta":{"slug":"btc-updown-5m-1769000000","series":"btc-updown-5m","source":"clob"},"price":0.54,"size":10.0,"side":"BUY","outcome":"UP","receive_lag_ms":25}}
-{"kind":"market_tick","record":{"timestamp_ms":1769000000200,"meta":{"slug":"btc-updown-5m-1769000000","series":"btc-updown-5m","source":"coinbase"},"price":65000.25,"size":0.0,"side":"TICKER","outcome":"BTC-USD","receive_lag_ms":15}}
+{"kind":"market_tick","record":{"timestamp_ms":1769000000200,"meta":{"slug":"btc-updown-5m-1769000000","series":"btc-updown-5m","source":"chainlink"},"price":65000.25,"size":0.0,"side":"ORACLE","outcome":"btc/usd","receive_lag_ms":15}}
 {"kind":"regime_state","record":{"id":"btc-updown-5m-1769000000","regime":"STALE_DATA"}}
 "#,
     )
@@ -310,37 +339,38 @@ fn live_smoke_summary_counts_market_and_reference_ticks() {
     assert_eq!(report.market_ticks, 1);
     assert_eq!(report.reference_ticks, 1);
     assert_eq!(report.stale_states, 1);
+    assert_eq!(report.ndjson_bytes, std::fs::metadata(&path).unwrap().len());
     assert_eq!(report.first_tick_timestamp_ms, Some(1_769_000_000_100));
     assert_eq!(report.last_tick_timestamp_ms, Some(1_769_000_000_200));
-    assert_eq!(report.outcomes, vec!["BTC-USD", "UP"]);
+    assert_eq!(report.outcomes, vec!["UP", "btc/usd"]);
 }
 
 #[test]
 fn live_smoke_gate_requires_market_reference_and_required_outcomes() {
-    let outcomes = vec!["UP".to_string(), "DOWN".to_string(), "BTC-USD".to_string()];
+    let outcomes = vec!["UP".to_string(), "DOWN".to_string(), "btc/usd".to_string()];
 
     assert!(live_smoke_passed(
         1,
         1,
         &outcomes,
-        &["UP", "DOWN", "BTC-USD"]
+        &["UP", "DOWN", "btc/usd"]
     ));
     assert!(!live_smoke_passed(
         0,
         1,
         &outcomes,
-        &["UP", "DOWN", "BTC-USD"]
+        &["UP", "DOWN", "btc/usd"]
     ));
     assert!(!live_smoke_passed(
         1,
         0,
         &outcomes,
-        &["UP", "DOWN", "BTC-USD"]
+        &["UP", "DOWN", "btc/usd"]
     ));
     assert!(!live_smoke_passed(
         1,
         1,
-        &["UP".to_string(), "BTC-USD".to_string()],
-        &["UP", "DOWN", "BTC-USD"]
+        &["UP".to_string(), "btc/usd".to_string()],
+        &["UP", "DOWN", "btc/usd"]
     ));
 }
