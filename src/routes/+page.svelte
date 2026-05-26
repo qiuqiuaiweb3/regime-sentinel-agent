@@ -1,13 +1,10 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import uPlot from 'uplot';
+  import 'uplot/dist/uPlot.min.css';
   import {
-    CrosshairMode,
-    LineStyle,
-    createChart,
-    type IChartApi,
-    type ISeriesApi
-  } from 'lightweight-charts';
-  import {
+    LIVE_DASHBOARD_REFRESH_MS,
+    dashboardChartDataFromView,
     dashboardRunStateForSnapshot,
     fallbackDashboardSnapshot,
     fetchDashboardSnapshot,
@@ -16,6 +13,7 @@
     snapshotToDashboardView,
     type DashboardLanguage,
     type DashboardRunState,
+    type DashboardView,
     type DashboardSnapshot
   } from '$lib/dashboard';
 
@@ -51,6 +49,7 @@
     high: '高',
     elevated: '升高',
     watch: '观察',
+    waiting: '等待',
     normal: '正常'
   };
   const zhIndicatorLabels: Record<string, string> = {
@@ -81,12 +80,11 @@
   };
 
   let chartElement: HTMLDivElement;
-  let chart: IChartApi | undefined;
-  let priceSeries: ISeriesApi<'Line'> | undefined;
-  let fairSeries: ISeriesApi<'Line'> | undefined;
+  let chart: uPlot | undefined;
   let snapshot: DashboardSnapshot = fallbackDashboardSnapshot;
   let nowMs = Date.now();
   let dashboardView = snapshotToDashboardView(snapshot, nowMs);
+  let updatedUtc = formatUtcTime(snapshot.regime.updated_at_ms);
   let horizon = '1s';
   let mode: 'live' | 'replay' = 'live';
   let language: DashboardLanguage = 'en';
@@ -98,12 +96,19 @@
   let statePulse = false;
   let statePulseTimer: ReturnType<typeof setTimeout> | undefined;
   let countdownTimer: ReturnType<typeof setInterval> | undefined;
-  let summaryRefreshTimer: ReturnType<typeof setInterval> | undefined;
+  let dashboardRefreshTimer: ReturnType<typeof setInterval> | undefined;
 
   $: copy = getDashboardCopy(language);
   $: proofItems = proofItemsByLanguage[language];
+  $: updatedUtc = formatUtcTime(snapshot.regime.updated_at_ms);
 
   function applySnapshot(nextSnapshot: DashboardSnapshot) {
+    if (
+      nextSnapshot.mode === snapshot.mode &&
+      nextSnapshot.regime.updated_at_ms < snapshot.regime.updated_at_ms
+    ) {
+      return false;
+    }
     nowMs = Date.now();
     const nextDashboardView = snapshotToDashboardView(nextSnapshot, nowMs);
     if (
@@ -121,10 +126,8 @@
     snapshot = nextSnapshot;
     dashboardView = nextDashboardView;
     geminiEnabled = geminiUserEnabled || dashboardView.geminiEnabled;
-    priceSeries?.setData(dashboardView.priceData);
-    fairSeries?.setData(dashboardView.fairData);
-    priceSeries?.setMarkers(dashboardView.markers);
-    chart?.timeScale().fitContent();
+    updateChartData();
+    return true;
   }
 
   function refreshCountdown() {
@@ -132,14 +135,20 @@
     dashboardView = snapshotToDashboardView(snapshot, nowMs);
   }
 
-  async function refreshDashboard() {
-    runState = 'loading';
+  async function refreshDashboard(showLoading = true) {
+    if (showLoading) {
+      runState = 'loading';
+    }
     try {
       const nextSnapshot = await fetchDashboardSnapshot(fetch, mode);
-      applySnapshot(nextSnapshot);
-      runState = dashboardRunStateForSnapshot(nextSnapshot, mode, false);
+      const applied = applySnapshot(nextSnapshot);
+      if (applied && (showLoading || runState !== 'streaming')) {
+        runState = dashboardRunStateForSnapshot(nextSnapshot, mode, false);
+      }
     } catch {
-      runState = 'waiting-live-data';
+      if (showLoading) {
+        runState = 'waiting-live-data';
+      }
     }
   }
 
@@ -181,61 +190,192 @@
     geminiEnabled = geminiUserEnabled || dashboardView.geminiEnabled;
   }
 
-  function updatedUtcTime() {
-    return new Date(snapshot.regime.updated_at_ms).toISOString().slice(11, 19);
+  function formatUtcTime(timestampMs: number) {
+    return new Date(timestampMs).toISOString().slice(11, 19);
+  }
+
+  function chartDataFromView(view: DashboardView): uPlot.AlignedData {
+    return dashboardChartDataFromView(view) as uPlot.AlignedData;
+  }
+
+  function updateChartData() {
+    chart?.setData(chartDataFromView(dashboardView));
+    applyChartRange();
+  }
+
+  function applyChartRange() {
+    if (!chart) {
+      return;
+    }
+
+    if (dashboardView.marketWindow) {
+      chart.setScale('x', {
+        min: dashboardView.marketWindow.startTime,
+        max: dashboardView.marketWindow.endTime
+      });
+      return;
+    }
+
+    if (dashboardView.priceData.length === 0) {
+      const currentTime = Date.now() / 1000;
+      chart.setScale('x', {
+        min: currentTime - 150,
+        max: currentTime + 150
+      });
+      return;
+    }
+
+    if (dashboardView.priceData.length !== 1) {
+      return;
+    }
+
+    const pointTime = dashboardView.priceData[0].time;
+    chart.setScale('x', {
+      min: pointTime - 150,
+      max: pointTime + 150
+    });
+  }
+
+  function chartSize() {
+    return {
+      width: chartElement.clientWidth || 800,
+      height: chartElement.clientHeight || 220
+    };
+  }
+
+  function createChartOptions(): uPlot.Options {
+    const size = chartSize();
+    return {
+      ...size,
+      padding: [12, 10, 0, 38],
+      legend: {
+        show: false
+      },
+      cursor: {
+        x: true,
+        y: true,
+        drag: {
+          x: false,
+          y: false
+        }
+      },
+      scales: {
+        x: {
+          time: true,
+          range: (_self, min, max) => {
+            if (min === max) {
+              return [min - 150, max + 150];
+            }
+            return [min, max];
+          }
+        },
+        y: {
+          range: [0, 1]
+        }
+      },
+      axes: [
+        {
+          stroke: '#7e9098',
+          grid: {
+            stroke: 'rgba(120,140,150,0.22)',
+            width: 1
+          },
+          ticks: {
+            stroke: 'rgba(120,140,150,0.35)'
+          },
+          values: (_self, values) =>
+            values.map((value) => new Date(value * 1000).toISOString().slice(11, 19))
+        },
+        {
+          side: 1,
+          stroke: '#7e9098',
+          grid: {
+            stroke: 'rgba(120,140,150,0.22)',
+            width: 1
+          },
+          ticks: {
+            stroke: 'rgba(120,140,150,0.35)'
+          },
+          values: (_self, values) => values.map((value) => value.toFixed(2))
+        }
+      ],
+      series: [
+        {},
+        {
+          label: 'p_mid',
+          stroke: '#00e5ff',
+          width: 2,
+          points: {
+            show: true,
+            size: 5,
+            stroke: '#00e5ff',
+            fill: '#020405'
+          }
+        },
+        {
+          label: 'p_fair',
+          stroke: '#2dff55',
+          width: 2,
+          dash: [8, 6],
+          points: {
+            show: false
+          }
+        }
+      ],
+      plugins: [alertMarkersPlugin()]
+    };
+  }
+
+  function alertMarkersPlugin(): uPlot.Plugin {
+    return {
+      hooks: {
+        draw: [
+          (plot) => {
+            if (dashboardView.markers.length === 0) {
+              return;
+            }
+
+            const { ctx, bbox } = plot;
+            const leftBound = bbox.left;
+            const rightBound = bbox.left + bbox.width;
+            ctx.save();
+            ctx.strokeStyle = 'rgba(255,48,48,0.72)';
+            ctx.fillStyle = '#ff3030';
+            ctx.font = '12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
+            ctx.textBaseline = 'top';
+            for (const marker of dashboardView.markers) {
+              const x = plot.valToPos(marker.time, 'x', true);
+              if (x < leftBound || x > rightBound) {
+                continue;
+              }
+              ctx.beginPath();
+              ctx.moveTo(x, bbox.top);
+              ctx.lineTo(x, bbox.top + bbox.height);
+              ctx.stroke();
+              ctx.fillText(marker.text, Math.min(x + 5, rightBound - 120), bbox.top + 6);
+            }
+            ctx.restore();
+          }
+        ]
+      }
+    };
   }
 
   onMount(() => {
-    chart = createChart(chartElement, {
-      width: chartElement.clientWidth,
-      height: chartElement.clientHeight,
-      layout: {
-        background: { color: '#020405' },
-        textColor: '#b7c4c9'
-      },
-      grid: {
-        vertLines: { color: 'rgba(120,140,150,0.22)' },
-        horzLines: { color: 'rgba(120,140,150,0.22)' }
-      },
-      rightPriceScale: {
-        borderColor: 'rgba(120,140,150,0.35)'
-      },
-      timeScale: {
-        borderColor: 'rgba(120,140,150,0.35)',
-        timeVisible: true,
-        secondsVisible: true
-      },
-      crosshair: {
-        mode: CrosshairMode.Normal,
-        vertLine: { color: 'rgba(0,229,255,0.55)' },
-        horzLine: { color: 'rgba(0,229,255,0.35)' }
-      }
-    });
-
-    priceSeries = chart.addLineSeries({
-      color: '#00e5ff',
-      lineWidth: 2,
-      priceLineVisible: false
-    });
-    fairSeries = chart.addLineSeries({
-      color: '#2dff55',
-      lineWidth: 2,
-      lineStyle: LineStyle.Dashed,
-      priceLineVisible: false
-    });
-
-    applySnapshot(snapshot);
+    chart = new uPlot(createChartOptions(), chartDataFromView(dashboardView), chartElement);
+    applyChartRange();
 
     const resizeObserver = new ResizeObserver(() => {
-      chart?.resize(chartElement.clientWidth, chartElement.clientHeight);
-      chart?.timeScale().fitContent();
+      chart?.setSize(chartSize());
     });
     resizeObserver.observe(chartElement);
     void refreshDashboard();
     countdownTimer = setInterval(refreshCountdown, 1_000);
-    summaryRefreshTimer = setInterval(() => {
-      void refreshDashboard();
-    }, 60_000);
+    dashboardRefreshTimer = setInterval(() => {
+      if (runState !== 'streaming') {
+        void refreshDashboard(false);
+      }
+    }, LIVE_DASHBOARD_REFRESH_MS);
 
     const events = new EventSource('/api/dashboard/events');
     events.addEventListener('snapshot', (event) => {
@@ -264,10 +404,10 @@
       if (countdownTimer) {
         clearInterval(countdownTimer);
       }
-      if (summaryRefreshTimer) {
-        clearInterval(summaryRefreshTimer);
+      if (dashboardRefreshTimer) {
+        clearInterval(dashboardRefreshTimer);
       }
-      chart?.remove();
+      chart?.destroy();
     };
   });
 
@@ -281,11 +421,9 @@
   <header class="tui-command">
     <div class="brand-block">
       <h1>REGIME SENTINEL AGENT</h1>
-      <p>{dashboardView.marketTitle}</p>
     </div>
     <div class="market-strip">
-      <span>{dashboardView.marketSeries}</span>
-      <span class="truncate">{dashboardView.marketSlug}</span>
+      <span class="break-anywhere">{dashboardView.headerMarketLabel}</span>
     </div>
     <div class="command-actions">
       <div class="language-switch" aria-label={copy.languageLabel}>
@@ -313,7 +451,7 @@
         {/each}
       </div>
       <span class="stream-state" class:error={runState === 'stream-error'}>[{runStateLabel(runState)}]</span>
-      <button class="tui-button" type="button" on:click={refreshDashboard}>{copy.refresh}</button>
+      <button class="tui-button" type="button" on:click={() => refreshDashboard(true)}>{copy.refresh}</button>
     </div>
   </header>
 
@@ -338,11 +476,11 @@
           </div>
           <div>
             <dt>{copy.updatedUtc}</dt>
-            <dd>{updatedUtcTime()}</dd>
+            <dd>{updatedUtc}</dd>
           </div>
           <div>
             <dt>{copy.sourceState}</dt>
-            <dd>{dashboardView.sourceRegimeLabel}</dd>
+            <dd class="break-anywhere">{dashboardView.sourceRegimeLabel}</dd>
           </div>
           <div>
             <dt>{copy.marketSlug}</dt>
@@ -423,7 +561,11 @@
                       class="status-badge"
                       class:risk={row.status === 'high'}
                       class:warn={row.status === 'elevated' || row.status === 'watch'}
-                      class:ok={row.status !== 'high' && row.status !== 'elevated' && row.status !== 'watch'}
+                      class:waiting={row.status === 'waiting'}
+                      class:ok={row.status !== 'high' &&
+                        row.status !== 'elevated' &&
+                        row.status !== 'watch' &&
+                        row.status !== 'waiting'}
                     >
                       {statusLabel(row.status)}
                     </span>
@@ -447,18 +589,30 @@
     </section>
 
     <section class="tui-panel market-panel">
-        <div class="panel-row">
+      <div class="panel-row">
         <div>
           <div class="panel-title">[ {copy.marketWindowTitle} ]</div>
           <p>{copy.marketWindowDescription}</p>
         </div>
         <div class="chart-legend">
           <span class="cyan">p_mid</span>
-          <span class="green">p_fair</span>
+          <span class="green">{dashboardView.fairLineLabel}</span>
           <span class="red">{copy.alertsTitle.toLowerCase()}</span>
         </div>
       </div>
-      <div bind:this={chartElement} class="chart-surface"></div>
+      <div class="chart-shell">
+        <div bind:this={chartElement} class="chart-surface"></div>
+        {#if !dashboardView.hasMidpointData}
+          <div class="chart-empty-state">
+            <strong>{dashboardView.marketWindowStatusTitle}</strong>
+            <span>{dashboardView.marketWindowStatusDetail}</span>
+          </div>
+        {/if}
+      </div>
+      <div class:waiting={!dashboardView.hasMidpointData} class="chart-sample-status">
+        <strong>{dashboardView.marketWindowStatusTitle}</strong>
+        <span>{dashboardView.marketWindowStatusDetail}</span>
+      </div>
     </section>
 
     <section class="lower-grid">

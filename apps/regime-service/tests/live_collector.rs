@@ -1,7 +1,9 @@
 use regime_service::live_collector::{
     LiveCollectorConfig, append_ndjson_fallback, live_smoke_passed, market_ticks_from_message,
-    persist_market_tick_or_fallback, reference_tick_from_chainlink_message, stale_data_penalty,
-    stale_regime_state, summarize_live_smoke_ndjson,
+    midpoint_tick_from_midpoint_response, midpoint_ticks_from_midpoints_response,
+    parse_gamma_event_market, persist_market_tick_or_fallback,
+    reference_tick_from_chainlink_message, stale_data_penalty, stale_regime_state,
+    summarize_live_smoke_ndjson, target_window_start_seconds,
 };
 use serde_json::Value;
 
@@ -47,6 +49,67 @@ fn live_collector_config_builds_polymarket_market_subscription() {
             "custom_feature_enabled": true
         })
     );
+}
+
+#[test]
+fn live_collector_auto_discovery_does_not_require_static_asset_ids() {
+    let config = LiveCollectorConfig::from_env_values(
+        Some("true"),
+        Some("auto"),
+        Some("btc-updown-5m"),
+        None,
+        None,
+        None,
+        Some("/tmp/regime-fallback.ndjson"),
+        Some("1500"),
+    )
+    .expect("auto collector config");
+
+    assert!(config.enabled);
+    assert!(config.auto_discovery);
+    assert_eq!(config.slug, "auto");
+    assert_eq!(config.series, "btc-updown-5m");
+    assert!(config.asset_ids.is_empty());
+}
+
+#[test]
+fn target_window_start_seconds_uses_five_minute_grid() {
+    assert_eq!(
+        target_window_start_seconds(1_779_768_404, 300),
+        1_779_768_300
+    );
+    assert_eq!(
+        target_window_start_seconds(1_779_768_511, 300),
+        1_779_768_300
+    );
+}
+
+#[test]
+fn gamma_event_market_parser_extracts_active_clob_tokens() {
+    let market = parse_gamma_event_market(
+        "btc-updown-5m-1779768300",
+        "btc-updown-5m",
+        &serde_json::json!({
+            "markets": [
+                {
+                    "active": true,
+                    "closed": false,
+                    "clobTokenIds": "[\"yes-token\", \"no-token\"]",
+                    "outcomes": "[\"Up\", \"Down\"]"
+                }
+            ]
+        }),
+        1_779_768_300,
+        300,
+    )
+    .expect("parsed market");
+
+    assert_eq!(market.slug, "btc-updown-5m-1779768300");
+    assert_eq!(market.series, "btc-updown-5m");
+    assert_eq!(market.asset_ids, vec!["yes-token", "no-token"]);
+    assert_eq!(market.outcomes, vec!["UP", "DOWN"]);
+    assert_eq!(market.window_start_s, 1_779_768_300);
+    assert_eq!(market.window_end_s, 1_779_768_600);
 }
 
 #[test]
@@ -231,6 +294,72 @@ fn chainlink_reference_ticks_ignore_plain_websocket_heartbeats() {
         reference_tick_from_chainlink_message("PONG", &config, 1_500).expect("heartbeat ignored");
 
     assert!(tick.is_none());
+}
+
+#[test]
+fn midpoint_response_converts_to_bba_ticks_for_current_market_assets() {
+    let config = LiveCollectorConfig::from_env_values(
+        Some("true"),
+        Some("btc-updown-5m-1769000000"),
+        Some("btc-updown-5m"),
+        Some("yes-token,no-token"),
+        Some("UP,DOWN"),
+        None,
+        Some("/tmp/regime-fallback.ndjson"),
+        Some("1500"),
+    )
+    .expect("collector config");
+
+    let ticks = midpoint_ticks_from_midpoints_response(
+        &serde_json::json!({
+            "yes-token": "0.515",
+            "no-token": "0.485",
+            "unrelated-token": "0.900"
+        }),
+        &config.market_meta(),
+        1_769_000_001_250,
+    )
+    .expect("midpoint ticks");
+
+    assert_eq!(ticks.len(), 2);
+    assert_eq!(ticks[0].timestamp_ms, 1_769_000_001_250);
+    assert_eq!(ticks[0].meta.source, "clob");
+    assert_eq!(ticks[0].price, 0.515);
+    assert_eq!(ticks[0].side, "BBA");
+    assert_eq!(ticks[0].outcome, "UP");
+    assert_eq!(ticks[0].receive_lag_ms, 0);
+    assert_eq!(ticks[1].price, 0.485);
+    assert_eq!(ticks[1].outcome, "DOWN");
+}
+
+#[test]
+fn single_midpoint_response_converts_to_bba_tick_for_token_id() {
+    let config = LiveCollectorConfig::from_env_values(
+        Some("true"),
+        Some("btc-updown-5m-1769000000"),
+        Some("btc-updown-5m"),
+        Some("yes-token,no-token"),
+        Some("UP,DOWN"),
+        None,
+        Some("/tmp/regime-fallback.ndjson"),
+        Some("1500"),
+    )
+    .expect("collector config");
+
+    let tick = midpoint_tick_from_midpoint_response(
+        &serde_json::json!({ "mid": "0.975" }),
+        &config.market_meta(),
+        "yes-token",
+        1_769_000_001_250,
+    )
+    .expect("midpoint tick");
+
+    assert_eq!(tick.timestamp_ms, 1_769_000_001_250);
+    assert_eq!(tick.meta.slug, "btc-updown-5m-1769000000");
+    assert_eq!(tick.meta.source, "clob");
+    assert_eq!(tick.price, 0.975);
+    assert_eq!(tick.side, "BBA");
+    assert_eq!(tick.outcome, "UP");
 }
 
 #[test]

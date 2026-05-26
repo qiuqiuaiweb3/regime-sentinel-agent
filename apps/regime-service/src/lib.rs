@@ -1687,8 +1687,8 @@ pub mod gemini_summary {
 }
 
 pub mod live_collector {
-    use anyhow::Context;
-    use futures_util::{SinkExt, StreamExt};
+    use anyhow::{Context, anyhow};
+    use futures_util::{SinkExt, StreamExt, future::join_all};
     use regime_core::{MarketTickMeta, MarketTickRecord, RegimeStateRecord};
     use serde::Serialize;
     use serde_json::{Value, json};
@@ -1704,10 +1704,16 @@ pub mod live_collector {
     pub const DEFAULT_REFERENCE_WS_URL: &str = "wss://ws-live-data.polymarket.com";
     pub const DEFAULT_REFERENCE_SYMBOL: &str = "btc/usd";
     pub const DEFAULT_STALE_AFTER_MS: i64 = 1_500;
+    pub const AUTO_MARKET_SLUG: &str = "auto";
+    pub const DEFAULT_GAMMA_API_BASE_URL: &str = "https://gamma-api.polymarket.com";
+    pub const DEFAULT_CLOB_API_BASE_URL: &str = "https://clob.polymarket.com";
+    pub const DEFAULT_WINDOW_STEP_SECONDS: i64 = 300;
+    const AUTO_DISCOVERY_SETTLE_SECONDS: i64 = 5;
 
     #[derive(Debug, Clone, PartialEq)]
     pub struct LiveCollectorConfig {
         pub enabled: bool,
+        pub auto_discovery: bool,
         pub slug: String,
         pub series: String,
         pub asset_ids: Vec<String>,
@@ -1725,6 +1731,16 @@ pub mod live_collector {
         pub series: String,
         pub source: String,
         asset_outcomes: Vec<(String, String)>,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct DiscoveredLiveMarket {
+        pub slug: String,
+        pub series: String,
+        pub asset_ids: Vec<String>,
+        pub outcomes: Vec<String>,
+        pub window_start_s: i64,
+        pub window_end_s: i64,
     }
 
     #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1765,6 +1781,7 @@ pub mod live_collector {
             if !enabled {
                 return Ok(Self {
                     enabled,
+                    auto_discovery: false,
                     slug: "disabled".to_string(),
                     series: "disabled".to_string(),
                     asset_ids: Vec::new(),
@@ -1779,6 +1796,22 @@ pub mod live_collector {
 
             let slug = required_string(slug, "LIVE_MARKET_SLUG")?;
             let series = required_string(series, "LIVE_MARKET_SERIES")?;
+            if slug == AUTO_MARKET_SLUG {
+                return Ok(Self {
+                    enabled,
+                    auto_discovery: true,
+                    slug: slug.to_string(),
+                    series: series.to_string(),
+                    asset_ids: Vec::new(),
+                    outcomes: Vec::new(),
+                    market_ws_url: market_ws_url.unwrap_or(DEFAULT_MARKET_WS_URL).to_string(),
+                    reference_ws_url: DEFAULT_REFERENCE_WS_URL.to_string(),
+                    reference_symbol: DEFAULT_REFERENCE_SYMBOL.to_string(),
+                    ndjson_path: PathBuf::from(ndjson_path.unwrap_or("data/live-fallback.ndjson")),
+                    stale_after_ms,
+                });
+            }
+
             let asset_ids = parse_csv(required_string(asset_ids, "POLYMARKET_ASSET_IDS")?);
             if asset_ids.is_empty() {
                 return Err("POLYMARKET_ASSET_IDS must include at least one asset id".to_string());
@@ -1797,6 +1830,7 @@ pub mod live_collector {
 
             Ok(Self {
                 enabled,
+                auto_discovery: false,
                 slug: slug.to_string(),
                 series: series.to_string(),
                 asset_ids,
@@ -1876,6 +1910,101 @@ pub mod live_collector {
             self.ndjson_path = ndjson_path;
             self
         }
+
+        pub fn with_discovered_market(mut self, market: &DiscoveredLiveMarket) -> Self {
+            self.auto_discovery = false;
+            self.slug = market.slug.clone();
+            self.series = market.series.clone();
+            self.asset_ids = market.asset_ids.clone();
+            self.outcomes = market.outcomes.clone();
+            self
+        }
+    }
+
+    pub fn target_window_start_seconds(now_s: i64, step_s: i64) -> i64 {
+        if step_s <= 0 {
+            return now_s;
+        }
+
+        now_s - now_s.rem_euclid(step_s)
+    }
+
+    pub fn parse_gamma_event_market(
+        slug: &str,
+        series: &str,
+        value: &Value,
+        window_start_s: i64,
+        step_s: i64,
+    ) -> Result<DiscoveredLiveMarket, String> {
+        let markets = value
+            .get("markets")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "Gamma event response missing markets".to_string())?;
+        let mut last_error = None;
+
+        for market in markets {
+            if !bool_field(market, "active", false) || bool_field(market, "closed", false) {
+                continue;
+            }
+
+            match parse_gamma_market_fields(slug, series, market, window_start_s, step_s) {
+                Ok(discovered) => return Ok(discovered),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| "Gamma event has no active open CLOB market".to_string()))
+    }
+
+    pub async fn discover_live_market(
+        config: &LiveCollectorConfig,
+        now_s: i64,
+    ) -> anyhow::Result<DiscoveredLiveMarket> {
+        let client = reqwest::Client::builder()
+            .user_agent("Mozilla/5.0 (compatible; regime-sentinel-agent/0.1)")
+            .timeout(Duration::from_secs(8))
+            .build()
+            .context("build Gamma API client")?;
+        let base_url = std::env::var("GAMMA_API_BASE_URL")
+            .unwrap_or_else(|_| DEFAULT_GAMMA_API_BASE_URL.to_string());
+        let target_start = target_window_start_seconds(now_s, DEFAULT_WINDOW_STEP_SECONDS);
+
+        let mut last_error = None;
+        for window_start_s in [target_start] {
+            let slug = format!("{}-{window_start_s}", config.series);
+            let url = format!("{}/events/slug/{slug}", base_url.trim_end_matches('/'));
+            match fetch_gamma_event(&client, &url).await.and_then(|value| {
+                parse_gamma_event_market(
+                    &slug,
+                    &config.series,
+                    &value,
+                    window_start_s,
+                    DEFAULT_WINDOW_STEP_SECONDS,
+                )
+                .map_err(anyhow::Error::msg)
+            }) {
+                Ok(market) => return Ok(market),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("no active {} market discovered", config.series)))
+    }
+
+    async fn fetch_gamma_event(client: &reqwest::Client, url: &str) -> anyhow::Result<Value> {
+        let response = client
+            .get(url)
+            .send()
+            .await
+            .with_context(|| format!("fetch Gamma event {url}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(anyhow!("Gamma event request returned {status}"));
+        }
+        response
+            .json::<Value>()
+            .await
+            .context("parse Gamma event JSON")
     }
 
     pub fn market_ticks_from_message(
@@ -1976,16 +2105,26 @@ pub mod live_collector {
         tick: &MarketTickRecord,
         fallback_path: &Path,
     ) -> anyhow::Result<()> {
-        let Some(store) = store else {
-            return append_ndjson_fallback(fallback_path, "market_tick", tick);
-        };
+        append_ndjson_fallback(fallback_path, "market_tick", tick)?;
 
-        if let Err(error) = store.insert_market_tick(tick).await {
-            tracing::warn!(
-                ?error,
-                "market tick MongoDB write failed; using NDJSON fallback"
-            );
-            append_ndjson_fallback(fallback_path, "market_tick", tick)?;
+        if let Some(store) = store {
+            match tokio::time::timeout(Duration::from_millis(500), store.insert_market_tick(tick))
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        ?error,
+                        "market tick MongoDB write failed after NDJSON append"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        "market tick MongoDB write timed out after NDJSON append"
+                    );
+                }
+            }
         }
 
         Ok(())
@@ -1996,16 +2135,26 @@ pub mod live_collector {
         state: &RegimeStateRecord,
         fallback_path: &Path,
     ) -> anyhow::Result<()> {
-        let Some(store) = store else {
-            return append_ndjson_fallback(fallback_path, "regime_state", state);
-        };
+        append_ndjson_fallback(fallback_path, "regime_state", state)?;
 
-        if let Err(error) = store.upsert_regime_state(state).await {
-            tracing::warn!(
-                ?error,
-                "regime state MongoDB write failed; using NDJSON fallback"
-            );
-            append_ndjson_fallback(fallback_path, "regime_state", state)?;
+        if let Some(store) = store {
+            match tokio::time::timeout(Duration::from_millis(500), store.upsert_regime_state(state))
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        ?error,
+                        "regime state MongoDB write failed after NDJSON append"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        "regime state MongoDB write timed out after NDJSON append"
+                    );
+                }
+            }
         }
 
         Ok(())
@@ -2015,39 +2164,150 @@ pub mod live_collector {
         config: LiveCollectorConfig,
         store: Option<crate::mongo_store::MongoStore>,
     ) -> anyhow::Result<()> {
+        run_live_collector_with_deadline(config, store, None).await
+    }
+
+    async fn run_live_collector_with_deadline(
+        config: LiveCollectorConfig,
+        store: Option<crate::mongo_store::MongoStore>,
+        deadline_s: Option<i64>,
+    ) -> anyhow::Result<()> {
         if !config.enabled {
             return Ok(());
         }
 
         let meta = config.market_meta();
         let mut last_event_timestamp_ms = None;
+        let midpoint_client = reqwest::Client::builder()
+            .user_agent("Mozilla/5.0 (compatible; regime-sentinel-agent/0.1)")
+            .timeout(Duration::from_secs(2))
+            .build()
+            .context("build CLOB midpoint client")?;
+        let mut midpoint_poll = tokio::time::interval(Duration::from_secs(1));
+        midpoint_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
-            let ws_stream = match connect_live_websocket(&config.market_ws_url).await {
-                Ok((ws_stream, _)) => ws_stream,
-                Err(error) => {
-                    tracing::warn!(?error, "connect Polymarket market websocket failed");
-                    tokio::time::sleep(Duration::from_secs(3)).await;
-                    continue;
+            if deadline_reached(deadline_s) {
+                return Ok(());
+            }
+            poll_midpoint_snapshot(
+                &config,
+                &meta,
+                &midpoint_client,
+                store.as_ref(),
+                &mut last_event_timestamp_ms,
+            )
+            .await;
+
+            let ws_stream = loop {
+                let connect = connect_live_websocket(&config.market_ws_url);
+                tokio::pin!(connect);
+
+                let connect_result = loop {
+                    tokio::select! {
+                        _ = midpoint_poll.tick() => {
+                            if deadline_reached(deadline_s) {
+                                return Ok(());
+                            }
+                            poll_midpoint_snapshot(
+                                &config,
+                                &meta,
+                                &midpoint_client,
+                                store.as_ref(),
+                                &mut last_event_timestamp_ms,
+                            )
+                            .await;
+                        }
+                        result = &mut connect => break result,
+                    }
+                };
+
+                match connect_result {
+                    Ok((ws_stream, _)) => break ws_stream,
+                    Err(error) => {
+                        tracing::warn!(?error, "connect Polymarket market websocket failed");
+                        let reconnect_delay = tokio::time::sleep(Duration::from_secs(3));
+                        tokio::pin!(reconnect_delay);
+                        loop {
+                            tokio::select! {
+                                _ = midpoint_poll.tick() => {
+                                    if deadline_reached(deadline_s) {
+                                        return Ok(());
+                                    }
+                                    poll_midpoint_snapshot(
+                                        &config,
+                                        &meta,
+                                        &midpoint_client,
+                                        store.as_ref(),
+                                        &mut last_event_timestamp_ms,
+                                    )
+                                    .await;
+                                }
+                                _ = &mut reconnect_delay => break,
+                            }
+                        }
+                    }
                 }
             };
 
             let (mut write, mut read) = ws_stream.split();
-            write
-                .send(Message::Text(
+            match tokio::time::timeout(
+                Duration::from_secs(1),
+                write.send(Message::Text(
                     config.subscription_message().to_string().into(),
-                ))
-                .await
-                .context("send Polymarket market subscription")?;
+                )),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(?error, "send Polymarket market subscription failed");
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(?error, "send Polymarket market subscription timed out");
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    continue;
+                }
+            }
             let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
 
             loop {
                 tokio::select! {
+                    _ = midpoint_poll.tick() => {
+                        if deadline_reached(deadline_s) {
+                            return Ok(());
+                        }
+                        match fetch_midpoint_ticks(&config, &meta, &midpoint_client).await {
+                            Ok(ticks) => {
+                                persist_market_ticks(ticks, store.as_ref(), &config.ndjson_path, &mut last_event_timestamp_ms).await;
+                            }
+                            Err(error) => {
+                                tracing::debug!(?error, "poll CLOB midpoint snapshot failed");
+                            }
+                        }
+                    }
                     _ = heartbeat.tick() => {
-                        write
-                            .send(Message::Text("PING".into()))
-                            .await
-                            .context("send Polymarket market heartbeat")?;
+                        if deadline_reached(deadline_s) {
+                            return Ok(());
+                        }
+                        match tokio::time::timeout(
+                            Duration::from_secs(1),
+                            write.send(Message::Text("PING".into())),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                tracing::warn!(?error, "send Polymarket market heartbeat failed");
+                                break;
+                            }
+                            Err(error) => {
+                                tracing::warn!(?error, "send Polymarket market heartbeat timed out");
+                                break;
+                            }
+                        }
                         if let Some(state) = stale_regime_state(&config, last_event_timestamp_ms, unix_timestamp_ms()) {
                             persist_regime_state_or_fallback(store.as_ref(), &state, &config.ndjson_path).await?;
                         }
@@ -2084,17 +2344,117 @@ pub mod live_collector {
         }
     }
 
+    async fn fetch_midpoint_ticks(
+        config: &LiveCollectorConfig,
+        meta: &LiveMarketMeta,
+        client: &reqwest::Client,
+    ) -> anyhow::Result<Vec<MarketTickRecord>> {
+        if config.asset_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let base_url = std::env::var("CLOB_API_BASE_URL")
+            .unwrap_or_else(|_| DEFAULT_CLOB_API_BASE_URL.to_string());
+        let requests = config.asset_ids.iter().map(|asset_id| {
+            let url = format!(
+                "{}/midpoint?token_id={}",
+                base_url.trim_end_matches('/'),
+                asset_id
+            );
+            async move { fetch_single_midpoint_tick(client, &url, meta, asset_id).await }
+        });
+
+        let mut ticks = Vec::new();
+        let mut last_error = None;
+        for result in join_all(requests).await {
+            match result {
+                Ok(tick) => ticks.push(tick),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        if let Some(error) = last_error {
+            if ticks.is_empty() {
+                return Err(error);
+            }
+            tracing::debug!(
+                ?error,
+                "partial CLOB midpoint snapshot failed while other tokens succeeded"
+            );
+        }
+        Ok(ticks)
+    }
+
+    async fn poll_midpoint_snapshot(
+        config: &LiveCollectorConfig,
+        meta: &LiveMarketMeta,
+        client: &reqwest::Client,
+        store: Option<&crate::mongo_store::MongoStore>,
+        last_event_timestamp_ms: &mut Option<i64>,
+    ) {
+        match fetch_midpoint_ticks(config, meta, client).await {
+            Ok(ticks) => {
+                persist_market_ticks(ticks, store, &config.ndjson_path, last_event_timestamp_ms)
+                    .await;
+            }
+            Err(error) => {
+                tracing::warn!(?error, "poll CLOB midpoint snapshot failed");
+            }
+        }
+    }
+
+    async fn fetch_single_midpoint_tick(
+        client: &reqwest::Client,
+        url: &str,
+        meta: &LiveMarketMeta,
+        asset_id: &str,
+    ) -> anyhow::Result<MarketTickRecord> {
+        let value = client
+            .get(url)
+            .send()
+            .await
+            .with_context(|| format!("request CLOB midpoint {url}"))?
+            .error_for_status()
+            .with_context(|| format!("CLOB midpoint response status {url}"))?
+            .json::<Value>()
+            .await
+            .with_context(|| format!("decode CLOB midpoint response {url}"))?;
+
+        midpoint_tick_from_midpoint_response(&value, meta, asset_id, unix_timestamp_ms())
+            .map_err(anyhow::Error::msg)
+    }
+
     pub async fn run_reference_price_collector(
         config: LiveCollectorConfig,
         store: Option<crate::mongo_store::MongoStore>,
+    ) -> anyhow::Result<()> {
+        run_reference_price_collector_with_deadline(config, store, None).await
+    }
+
+    async fn run_reference_price_collector_with_deadline(
+        config: LiveCollectorConfig,
+        store: Option<crate::mongo_store::MongoStore>,
+        deadline_s: Option<i64>,
     ) -> anyhow::Result<()> {
         if !config.enabled {
             return Ok(());
         }
 
         loop {
-            let ws_stream = match connect_live_websocket(&config.reference_ws_url).await {
-                Ok((ws_stream, _)) => ws_stream,
+            if deadline_reached(deadline_s) {
+                return Ok(());
+            }
+            let ws_stream = match tokio::time::timeout(
+                Duration::from_secs(8),
+                connect_live_websocket(&config.reference_ws_url),
+            )
+            .await
+            {
+                Ok(Ok((ws_stream, _))) => ws_stream,
+                Ok(Err(error)) => {
+                    tracing::warn!(?error, "connect reference price websocket failed");
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    continue;
+                }
                 Err(error) => {
                     tracing::warn!(?error, "connect reference price websocket failed");
                     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -2103,21 +2463,50 @@ pub mod live_collector {
             };
 
             let (mut write, mut read) = ws_stream.split();
-            write
-                .send(Message::Text(
+            match tokio::time::timeout(
+                Duration::from_secs(1),
+                write.send(Message::Text(
                     config.reference_subscription_message().to_string().into(),
-                ))
-                .await
-                .context("send reference price subscription")?;
+                )),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(?error, "send reference price subscription failed");
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(?error, "send reference price subscription timed out");
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    continue;
+                }
+            }
             let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
 
             loop {
                 tokio::select! {
                     _ = heartbeat.tick() => {
-                        write
-                            .send(Message::Text("PING".into()))
-                            .await
-                            .context("send reference price heartbeat")?;
+                        if deadline_reached(deadline_s) {
+                            return Ok(());
+                        }
+                        match tokio::time::timeout(
+                            Duration::from_secs(1),
+                            write.send(Message::Text("PING".into())),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                tracing::warn!(?error, "send reference price heartbeat failed");
+                                break;
+                            }
+                            Err(error) => {
+                                tracing::warn!(?error, "send reference price heartbeat timed out");
+                                break;
+                            }
+                        }
                     }
                     message = read.next() => {
                         match message {
@@ -2163,6 +2552,60 @@ pub mod live_collector {
             }
 
             tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    }
+
+    pub async fn run_auto_rotating_live_collectors(
+        config: LiveCollectorConfig,
+        store: Option<crate::mongo_store::MongoStore>,
+    ) -> anyhow::Result<()> {
+        if !config.enabled {
+            return Ok(());
+        }
+
+        loop {
+            let now_s = unix_timestamp_ms() / 1_000;
+            let market = match discover_live_market(&config, now_s).await {
+                Ok(market) => market,
+                Err(error) => {
+                    tracing::warn!(?error, "auto market discovery failed");
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    continue;
+                }
+            };
+            let deadline_s = market.window_end_s + AUTO_DISCOVERY_SETTLE_SECONDS;
+            tracing::info!(
+                slug = %market.slug,
+                deadline_s,
+                "starting auto-discovered live collectors"
+            );
+
+            let market_config = config
+                .clone()
+                .with_discovered_market(&market)
+                .with_ndjson_path(config.ndjson_path_for_role("market"));
+            let reference_config = config
+                .clone()
+                .with_discovered_market(&market)
+                .with_ndjson_path(config.ndjson_path_for_role("reference"));
+            let market_store = store.clone();
+            let reference_store = store.clone();
+            let (market_result, reference_result) = tokio::join!(
+                run_live_collector_with_deadline(market_config, market_store, Some(deadline_s)),
+                run_reference_price_collector_with_deadline(
+                    reference_config,
+                    reference_store,
+                    Some(deadline_s)
+                )
+            );
+
+            if let Err(error) = market_result {
+                tracing::warn!(?error, "auto market collector window stopped with error");
+            }
+            if let Err(error) = reference_result {
+                tracing::warn!(?error, "auto reference collector window stopped with error");
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
 
@@ -2300,17 +2743,24 @@ pub mod live_collector {
     ) {
         match market_ticks_from_message(payload, meta, unix_timestamp_ms()) {
             Ok(ticks) => {
-                for tick in ticks {
-                    *last_event_timestamp_ms = Some(tick.timestamp_ms);
-                    if let Err(error) =
-                        persist_market_tick_or_fallback(store, &tick, fallback_path).await
-                    {
-                        tracing::warn!(?error, "persist market tick failed");
-                    }
-                }
+                persist_market_ticks(ticks, store, fallback_path, last_event_timestamp_ms).await;
             }
             Err(error) => {
                 tracing::warn!(%error, "parse Polymarket market websocket message failed");
+            }
+        }
+    }
+
+    async fn persist_market_ticks(
+        ticks: Vec<MarketTickRecord>,
+        store: Option<&crate::mongo_store::MongoStore>,
+        fallback_path: &Path,
+        last_event_timestamp_ms: &mut Option<i64>,
+    ) {
+        for tick in ticks {
+            *last_event_timestamp_ms = Some(tick.timestamp_ms);
+            if let Err(error) = persist_market_tick_or_fallback(store, &tick, fallback_path).await {
+                tracing::warn!(?error, "persist market tick failed");
             }
         }
     }
@@ -2361,6 +2811,59 @@ pub mod live_collector {
             "book" => book_tick(value, meta, received_at_ms).map(|tick| tick.into_iter().collect()),
             _ => Ok(Vec::new()),
         }
+    }
+
+    pub fn midpoint_ticks_from_midpoints_response(
+        value: &Value,
+        meta: &LiveMarketMeta,
+        received_at_ms: i64,
+    ) -> Result<Vec<MarketTickRecord>, String> {
+        let prices = value
+            .as_object()
+            .ok_or_else(|| "midpoints response must be an object".to_string())?;
+        let mut ticks = Vec::new();
+
+        for (asset_id, outcome) in &meta.asset_outcomes {
+            let Some(price_value) = prices.get(asset_id) else {
+                continue;
+            };
+            ticks.push(MarketTickRecord {
+                timestamp_ms: received_at_ms,
+                meta: MarketTickMeta {
+                    slug: meta.slug.clone(),
+                    series: meta.series.clone(),
+                    source: meta.source.clone(),
+                },
+                price: f64_value(price_value, "midpoint")?,
+                size: 0.0,
+                side: "BBA".to_string(),
+                outcome: outcome.clone(),
+                receive_lag_ms: 0,
+            });
+        }
+
+        Ok(ticks)
+    }
+
+    pub fn midpoint_tick_from_midpoint_response(
+        value: &Value,
+        meta: &LiveMarketMeta,
+        asset_id: &str,
+        received_at_ms: i64,
+    ) -> Result<MarketTickRecord, String> {
+        Ok(MarketTickRecord {
+            timestamp_ms: received_at_ms,
+            meta: MarketTickMeta {
+                slug: meta.slug.clone(),
+                series: meta.series.clone(),
+                source: meta.source.clone(),
+            },
+            price: f64_field(value, "mid")?,
+            size: 0.0,
+            side: "BBA".to_string(),
+            outcome: meta.outcome_for_asset(asset_id),
+            receive_lag_ms: 0,
+        })
     }
 
     fn price_change_ticks(
@@ -2484,10 +2987,17 @@ pub mod live_collector {
 
     fn f64_field(value: &Value, field: &str) -> Result<f64, String> {
         match value.get(field) {
-            Some(Value::String(raw)) => raw
+            Some(raw) => f64_value(raw, field),
+            _ => Err(format!("missing float field {field}")),
+        }
+    }
+
+    fn f64_value(value: &Value, field: &str) -> Result<f64, String> {
+        match value {
+            Value::String(raw) => raw
                 .parse::<f64>()
                 .map_err(|_| format!("invalid float field {field}")),
-            Some(Value::Number(raw)) => raw
+            Value::Number(raw) => raw
                 .as_f64()
                 .ok_or_else(|| format!("invalid float field {field}")),
             _ => Err(format!("missing float field {field}")),
@@ -2499,6 +3009,80 @@ pub mod live_collector {
             "1" | "true" | "yes" | "on" => Ok(true),
             "0" | "false" | "no" | "off" => Ok(false),
             _ => Err("LIVE_COLLECTOR_ENABLED must be a boolean".to_string()),
+        }
+    }
+
+    fn parse_gamma_market_fields(
+        slug: &str,
+        series: &str,
+        market: &Value,
+        window_start_s: i64,
+        step_s: i64,
+    ) -> Result<DiscoveredLiveMarket, String> {
+        let asset_ids = string_array_field(market, "clobTokenIds")?;
+        if asset_ids.len() < 2 {
+            return Err("Gamma market must include at least two clobTokenIds".to_string());
+        }
+
+        let outcomes: Vec<String> = match string_array_field(market, "outcomes") {
+            Ok(values) if !values.is_empty() => values
+                .into_iter()
+                .map(|value| value.trim().to_ascii_uppercase())
+                .collect(),
+            _ => (0..asset_ids.len())
+                .map(|index| format!("OUTCOME_{index}"))
+                .collect(),
+        };
+        if outcomes.len() != asset_ids.len() {
+            return Err("Gamma market outcomes length must match clobTokenIds".to_string());
+        }
+
+        Ok(DiscoveredLiveMarket {
+            slug: slug.to_string(),
+            series: series.to_string(),
+            asset_ids,
+            outcomes,
+            window_start_s,
+            window_end_s: window_start_s + step_s,
+        })
+    }
+
+    fn string_array_field(value: &Value, field: &str) -> Result<Vec<String>, String> {
+        let field_value = value
+            .get(field)
+            .ok_or_else(|| format!("Gamma market missing {field}"))?;
+        string_array_value(field_value).map_err(|error| format!("{field}: {error}"))
+    }
+
+    fn string_array_value(value: &Value) -> Result<Vec<String>, String> {
+        match value {
+            Value::Array(items) => items
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| "expected non-empty string item".to_string())
+                })
+                .collect(),
+            Value::String(raw) => {
+                let parsed: Value = serde_json::from_str(raw)
+                    .map_err(|error| format!("invalid encoded array: {error}"))?;
+                string_array_value(&parsed)
+            }
+            _ => Err("expected string array or encoded string array".to_string()),
+        }
+    }
+
+    fn bool_field(value: &Value, field: &str, default: bool) -> bool {
+        match value.get(field) {
+            Some(Value::Bool(value)) => *value,
+            Some(Value::String(value)) => match value.to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" => true,
+                "false" | "0" | "no" => false,
+                _ => default,
+            },
+            _ => default,
         }
     }
 
@@ -2516,6 +3100,13 @@ pub mod live_collector {
             .filter(|value| !value.is_empty())
             .map(ToString::to_string)
             .collect()
+    }
+
+    fn deadline_reached(deadline_s: Option<i64>) -> bool {
+        match deadline_s {
+            Some(deadline_s) => unix_timestamp_ms() / 1_000 >= deadline_s,
+            None => false,
+        }
     }
 
     fn unix_timestamp_ms() -> i64 {
@@ -3695,11 +4286,7 @@ async fn dashboard_snapshot(
     Query(query): Query<DashboardSnapshotQuery>,
 ) -> Json<DashboardSnapshot> {
     let mode = dashboard_mode(query.mode.as_deref());
-    let mut snapshot = dashboard_snapshot_for_state(&state, mode);
-    if let Some(summary) = cached_dashboard_gemini_summary(&state).await {
-        snapshot.gemini_summary = summary;
-    }
-    Json(snapshot)
+    Json(dashboard_snapshot_for_state_with_summary(&state, mode).await)
 }
 
 async fn dashboard_events(
@@ -3709,8 +4296,8 @@ async fn dashboard_events(
         (tokio::time::interval(Duration::from_secs(1)), state),
         |(mut interval, state)| async {
             interval.tick().await;
-            let data = serde_json::to_string(&dashboard_snapshot_for_state(&state, "live"))
-                .expect("dashboard snapshot serializes");
+            let snapshot = dashboard_snapshot_for_state_with_summary(&state, "live").await;
+            let data = serde_json::to_string(&snapshot).expect("dashboard snapshot serializes");
             Some((
                 Ok(Event::default().event("snapshot").data(data)),
                 (interval, state),
@@ -3729,6 +4316,17 @@ fn dashboard_snapshot_for_state(state: &AppState, mode: &str) -> DashboardSnapsh
             live_dashboard_snapshot(mode, paths, state.manual_explain.throttle.enabled)
         })
         .unwrap_or_else(|| sample_dashboard_snapshot(mode))
+}
+
+async fn dashboard_snapshot_for_state_with_summary(
+    state: &AppState,
+    mode: &str,
+) -> DashboardSnapshot {
+    let mut snapshot = dashboard_snapshot_for_state(state, mode);
+    if let Some(summary) = cached_dashboard_gemini_summary(state).await {
+        snapshot.gemini_summary = summary;
+    }
+    snapshot
 }
 
 fn dashboard_mode(mode: Option<&str>) -> &'static str {
@@ -3789,27 +4387,28 @@ fn live_dashboard_snapshot(
     }
 
     ticks.sort_by_key(|tick| tick.timestamp_ms);
-    let latest_ts = ticks
+    let latest_tick = ticks.last().expect("non-empty live ticks");
+    let latest_slug = latest_tick.meta.slug.clone();
+    let series = latest_tick.meta.series.clone();
+    let now_ms = unix_timestamp_ms();
+    let slug = dashboard_active_market_slug(&latest_slug, &series, now_ms / 1_000);
+    let current_ticks = ticks
+        .iter()
+        .filter(|tick| tick.meta.slug == slug)
+        .cloned()
+        .collect::<Vec<_>>();
+    let scoped_ticks = if current_ticks.is_empty() && slug == latest_slug {
+        ticks
+    } else {
+        current_ticks
+    };
+    let latest_ts = scoped_ticks
         .iter()
         .map(|tick| tick.timestamp_ms)
         .max()
-        .unwrap_or_else(unix_timestamp_ms);
-    let slug = ticks
-        .iter()
-        .rev()
-        .find(|tick| tick.meta.source == "clob")
-        .or_else(|| ticks.last())
-        .map(|tick| tick.meta.slug.clone())
-        .unwrap_or_else(|| "live".to_string());
-    let series = ticks
-        .iter()
-        .rev()
-        .find(|tick| tick.meta.source == "clob")
-        .or_else(|| ticks.last())
-        .map(|tick| tick.meta.series.clone())
-        .unwrap_or_else(|| "live".to_string());
+        .unwrap_or(now_ms);
 
-    let mut up_points = ticks
+    let mut up_points = scoped_ticks
         .iter()
         .filter(|tick| {
             tick.meta.source == "clob"
@@ -3822,54 +4421,43 @@ fn live_dashboard_snapshot(
             p_fair: 0.5,
         })
         .collect::<Vec<_>>();
-    if up_points.is_empty() {
-        up_points = ticks
-            .iter()
-            .filter(|tick| tick.meta.source == "clob" && is_up_outcome(&tick.outcome))
-            .map(|tick| DashboardPricePoint {
-                timestamp_ms: tick.timestamp_ms,
-                p_mid: tick.price,
-                p_fair: 0.5,
-            })
-            .collect::<Vec<_>>();
-    }
     up_points.sort_by_key(|point| point.timestamp_ms);
     up_points.dedup_by_key(|point| point.timestamp_ms);
 
-    if up_points.is_empty() {
-        let latest_reference = ticks
-            .iter()
-            .rev()
-            .find(|tick| tick.meta.source == "chainlink")?;
-        up_points.push(DashboardPricePoint {
-            timestamp_ms: latest_reference.timestamp_ms,
-            p_mid: latest_reference.price,
-            p_fair: latest_reference.price,
-        });
-    }
     if up_points.len() > 120 {
         up_points = up_points.split_off(up_points.len() - 120);
     }
 
-    let latest_up = up_points.last().map(|point| point.p_mid).unwrap_or(0.0);
-    let fair_gap = latest_up - 0.5;
+    let has_clob_midpoint = !up_points.is_empty();
+    let latest_up = up_points.last().map(|point| point.p_mid).unwrap_or(0.5);
+    let fair_gap = if has_clob_midpoint {
+        latest_up - 0.5
+    } else {
+        0.0
+    };
     let mid_velocity_1s = point_velocity(&up_points, 1_000);
     let mid_velocity_5s = point_velocity(&up_points, 5_000);
-    let order_flow_1s = order_flow_imbalance(&ticks, latest_ts, 1_000);
-    let reference_velocity_1s = reference_velocity(&ticks, 1_000);
+    let order_flow_1s = order_flow_imbalance(&scoped_ticks, latest_ts, 1_000);
+    let reference_velocity_1s = reference_velocity(&scoped_ticks, 1_000);
     let shift_score = live_shift_score(
         fair_gap,
         mid_velocity_1s,
         order_flow_1s,
         reference_velocity_1s,
     );
-    let (regime_state, regime_description) =
-        live_regime_description(latest_up, mid_velocity_1s, order_flow_1s, shift_score);
-    let market_tick_count = ticks
+    let (regime_state, regime_description) = if has_clob_midpoint {
+        live_regime_description(latest_up, mid_velocity_1s, order_flow_1s, shift_score)
+    } else {
+        (
+            "WAITING_LIVE_CLOB",
+            "Live collector is connected to the current window, but no Polymarket Up midpoint tick has been received yet.".to_string(),
+        )
+    };
+    let market_tick_count = scoped_ticks
         .iter()
         .filter(|tick| tick.meta.source == "clob")
         .count();
-    let reference_tick_count = ticks
+    let reference_tick_count = scoped_ticks
         .iter()
         .filter(|tick| tick.meta.source == "chainlink")
         .count();
@@ -3883,7 +4471,9 @@ fn live_dashboard_snapshot(
         },
         regime: DashboardRegime {
             state: regime_state,
-            confidence: if latest_ts + 5_000 >= unix_timestamp_ms() {
+            confidence: if !has_clob_midpoint {
+                "Low"
+            } else if latest_ts + 5_000 >= unix_timestamp_ms() {
                 "Normal"
             } else {
                 "Low"
@@ -3899,23 +4489,31 @@ fn live_dashboard_snapshot(
             next_update_at_ms: next_gemini_update_at_ms(Some(latest_ts), 1_800),
             interval_seconds: Some(1_800),
             coverage: "live collector".to_string(),
-            summary: "Live collector view: chart uses Polymarket Up midpoint ticks when available; the dashed fair line is neutral until live strike/start-price fair-probability is wired in.".to_string(),
+            summary: if has_clob_midpoint {
+                "Live collector view: chart uses Polymarket Up midpoint ticks when available; the dashed fair line is neutral until live strike/start-price fair-probability is wired in.".to_string()
+            } else {
+                "Live collector view: waiting for the first Polymarket Up midpoint tick; Chainlink BTC/USD is used only for reference velocity, not as p_mid.".to_string()
+            },
         },
-        similar_windows: vec![DashboardSimilarWindow {
-            slug,
-            window_ts_ms: latest_ts,
-            score: 1.0,
-            fair_gap,
-            ofi_1s: market_tick_count as f64,
-            depth_imbalance: reference_tick_count as f64,
-        }],
+        similar_windows: if has_clob_midpoint {
+            vec![DashboardSimilarWindow {
+                slug,
+                window_ts_ms: latest_ts,
+                score: 1.0,
+                fair_gap,
+                ofi_1s: market_tick_count as f64,
+                depth_imbalance: reference_tick_count as f64,
+            }]
+        } else {
+            Vec::new()
+        },
         regime_indicators: vec![
             DashboardRegimeIndicator {
                 key: "fair_gap",
                 label: "Fair gap",
                 value: fair_gap,
                 unit: "pp",
-                status: indicator_status(fair_gap.abs(), 0.03, 0.08),
+                status: live_indicator_status(has_clob_midpoint, fair_gap.abs(), 0.03, 0.08),
                 description: "Up midpoint minus the neutral fair line; positive values mean the market is pricing Up above neutral.",
             },
             DashboardRegimeIndicator {
@@ -3923,7 +4521,7 @@ fn live_dashboard_snapshot(
                 label: "Mid velocity 1s",
                 value: mid_velocity_1s,
                 unit: "pp/s",
-                status: indicator_status(mid_velocity_1s.abs(), 0.02, 0.07),
+                status: live_indicator_status(has_clob_midpoint, mid_velocity_1s.abs(), 0.02, 0.07),
                 description: "One-second change rate of the Polymarket Up midpoint.",
             },
             DashboardRegimeIndicator {
@@ -3931,7 +4529,7 @@ fn live_dashboard_snapshot(
                 label: "Order flow 1s",
                 value: order_flow_1s,
                 unit: "",
-                status: indicator_status(order_flow_1s.abs(), 0.25, 0.60),
+                status: live_indicator_status(has_clob_midpoint, order_flow_1s.abs(), 0.25, 0.60),
                 description: "Signed one-second flow proxy: Up buys and Down sells are positive; Up sells and Down buys are negative.",
             },
             DashboardRegimeIndicator {
@@ -3939,7 +4537,12 @@ fn live_dashboard_snapshot(
                 label: "BTC velocity 1s",
                 value: reference_velocity_1s,
                 unit: "$/s",
-                status: indicator_status(reference_velocity_1s.abs(), 20.0, 75.0),
+                status: live_indicator_status(
+                    has_clob_midpoint,
+                    reference_velocity_1s.abs(),
+                    20.0,
+                    75.0,
+                ),
                 description: "One-second Chainlink BTC/USD reference price velocity.",
             },
             DashboardRegimeIndicator {
@@ -3947,7 +4550,7 @@ fn live_dashboard_snapshot(
                 label: "Shift score",
                 value: shift_score,
                 unit: "",
-                status: shift_score_status(shift_score),
+                status: live_shift_score_status(has_clob_midpoint, shift_score),
                 description: "Combined live heuristic from fair gap, midpoint velocity, order flow, and BTC reference velocity.",
             },
             DashboardRegimeIndicator {
@@ -3955,7 +4558,7 @@ fn live_dashboard_snapshot(
                 label: "Mid velocity 5s",
                 value: mid_velocity_5s,
                 unit: "pp/s",
-                status: indicator_status(mid_velocity_5s.abs(), 0.01, 0.04),
+                status: live_indicator_status(has_clob_midpoint, mid_velocity_5s.abs(), 0.01, 0.04),
                 description: "Five-second normalized change rate of the Polymarket Up midpoint.",
             },
         ],
@@ -3982,6 +4585,32 @@ fn live_dashboard_snapshot(
             ],
         },
     })
+}
+
+fn dashboard_active_market_slug(latest_slug: &str, series: &str, now_s: i64) -> String {
+    let Some(window_start_s) = market_window_start_from_slug(latest_slug) else {
+        return latest_slug.to_string();
+    };
+    let window_end_s = window_start_s + live_collector::DEFAULT_WINDOW_STEP_SECONDS;
+    let active_start_s = live_collector::target_window_start_seconds(
+        now_s,
+        live_collector::DEFAULT_WINDOW_STEP_SECONDS,
+    );
+
+    if now_s >= window_end_s && active_start_s > window_start_s {
+        format!("{series}-{active_start_s}")
+    } else {
+        latest_slug.to_string()
+    }
+}
+
+fn market_window_start_from_slug(slug: &str) -> Option<i64> {
+    let suffix = slug.rsplit('-').next()?;
+    if suffix.len() != 10 || !suffix.chars().all(|value| value.is_ascii_digit()) {
+        return None;
+    }
+
+    suffix.parse().ok()
 }
 
 fn recent_market_ticks_from_ndjson(path: &Path, limit: usize) -> Vec<MarketTickRecord> {
@@ -4146,6 +4775,19 @@ fn indicator_status(value: f64, elevated_threshold: f64, high_threshold: f64) ->
     }
 }
 
+fn live_indicator_status(
+    has_clob_midpoint: bool,
+    value: f64,
+    elevated_threshold: f64,
+    high_threshold: f64,
+) -> &'static str {
+    if has_clob_midpoint {
+        indicator_status(value, elevated_threshold, high_threshold)
+    } else {
+        "waiting"
+    }
+}
+
 fn shift_score_status(score: f64) -> &'static str {
     if score >= 0.75 {
         "high"
@@ -4153,6 +4795,14 @@ fn shift_score_status(score: f64) -> &'static str {
         "watch"
     } else {
         "normal"
+    }
+}
+
+fn live_shift_score_status(has_clob_midpoint: bool, score: f64) -> &'static str {
+    if has_clob_midpoint {
+        shift_score_status(score)
+    } else {
+        "waiting"
     }
 }
 

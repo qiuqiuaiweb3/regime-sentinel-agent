@@ -3,7 +3,10 @@ use axum::{
     http::{Request, StatusCode},
 };
 use serde_json::{Value, json};
-use std::{fs, time::Duration};
+use std::{
+    fs,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use tower::ServiceExt;
 
 #[tokio::test]
@@ -506,6 +509,230 @@ async fn dashboard_snapshot_endpoint_reads_live_ndjson_when_available() {
     assert!((payload["regime_indicators"][1]["value"].as_f64().unwrap() - 0.07).abs() < 0.001);
     assert_eq!(payload["regime_indicators"][2]["key"], "order_flow_1s");
     assert_eq!(payload["regime_indicators"][2]["value"], 1.0);
+}
+
+#[tokio::test]
+async fn dashboard_snapshot_endpoint_does_not_chart_reference_price_as_probability() {
+    let temp_dir = tempfile::tempdir().expect("live dashboard temp dir");
+    let market_path = temp_dir.path().join("live.market.ndjson");
+    let reference_path = temp_dir.path().join("live.reference.ndjson");
+    fs::write(&market_path, "").expect("write empty market ndjson");
+    fs::write(
+        &reference_path,
+        r#"{"kind":"market_tick","record":{"timestamp_ms":1779494000100,"meta":{"slug":"btc-updown-5m-live","series":"btc-updown-5m","source":"chainlink"},"price":110000.0,"size":0.0,"side":"ORACLE","outcome":"btc/usd","receive_lag_ms":10}}
+"#,
+    )
+    .expect("write reference ndjson");
+
+    let response =
+        regime_service::build_router_with_live_dashboard_paths(market_path, reference_path)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dashboard/snapshot")
+                    .body(Body::empty())
+                    .expect("snapshot request"),
+            )
+            .await
+            .expect("snapshot response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("snapshot body");
+    let payload: Value = serde_json::from_slice(&body).expect("snapshot json");
+
+    assert_eq!(payload["market"]["slug"], "btc-updown-5m-live");
+    assert_eq!(payload["regime"]["state"], "WAITING_LIVE_CLOB");
+    assert_eq!(payload["price_points"].as_array().unwrap().len(), 0);
+    assert_eq!(payload["regime_indicators"][0]["key"], "fair_gap");
+    assert_eq!(payload["regime_indicators"][0]["value"], 0.0);
+    assert!(
+        payload["regime_indicators"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|indicator| indicator["status"] == "waiting")
+    );
+    assert_eq!(payload["similar_windows"].as_array().unwrap().len(), 0);
+    assert!(
+        payload["gemini_summary"]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("not as p_mid")
+    );
+}
+
+#[tokio::test]
+async fn dashboard_snapshot_endpoint_does_not_chart_trade_price_as_midpoint() {
+    let temp_dir = tempfile::tempdir().expect("live dashboard temp dir");
+    let market_path = temp_dir.path().join("live.market.ndjson");
+    let reference_path = temp_dir.path().join("live.reference.ndjson");
+    fs::write(
+        &market_path,
+        r#"{"kind":"market_tick","record":{"timestamp_ms":1779494000000,"meta":{"slug":"btc-updown-5m-live","series":"btc-updown-5m","source":"clob"},"price":0.58,"size":10.0,"side":"BUY","outcome":"Up","receive_lag_ms":25}}
+"#,
+    )
+    .expect("write market ndjson");
+    fs::write(
+        &reference_path,
+        r#"{"kind":"market_tick","record":{"timestamp_ms":1779494000100,"meta":{"slug":"btc-updown-5m-live","series":"btc-updown-5m","source":"chainlink"},"price":110000.0,"size":0.0,"side":"ORACLE","outcome":"btc/usd","receive_lag_ms":10}}
+"#,
+    )
+    .expect("write reference ndjson");
+
+    let response =
+        regime_service::build_router_with_live_dashboard_paths(market_path, reference_path)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dashboard/snapshot")
+                    .body(Body::empty())
+                    .expect("snapshot request"),
+            )
+            .await
+            .expect("snapshot response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("snapshot body");
+    let payload: Value = serde_json::from_slice(&body).expect("snapshot json");
+
+    assert_eq!(payload["regime"]["state"], "WAITING_LIVE_CLOB");
+    assert_eq!(payload["price_points"].as_array().unwrap().len(), 0);
+    assert_eq!(payload["regime_indicators"][0]["value"], 0.0);
+}
+
+#[tokio::test]
+async fn dashboard_snapshot_endpoint_filters_live_points_to_current_market_slug() {
+    let temp_dir = tempfile::tempdir().expect("live dashboard temp dir");
+    let market_path = temp_dir.path().join("live.market.ndjson");
+    let reference_path = temp_dir.path().join("live.reference.ndjson");
+    fs::write(
+        &market_path,
+        r#"{"kind":"market_tick","record":{"timestamp_ms":1779493999000,"meta":{"slug":"btc-updown-5m-old","series":"btc-updown-5m","source":"clob"},"price":0.91,"size":0.0,"side":"BBA","outcome":"Up","receive_lag_ms":25}}
+{"kind":"market_tick","record":{"timestamp_ms":1779494000000,"meta":{"slug":"btc-updown-5m-current","series":"btc-updown-5m","source":"clob"},"price":0.09,"size":0.0,"side":"BBA","outcome":"Down","receive_lag_ms":25}}
+"#,
+    )
+    .expect("write market ndjson");
+    fs::write(
+        &reference_path,
+        r#"{"kind":"market_tick","record":{"timestamp_ms":1779494000100,"meta":{"slug":"btc-updown-5m-current","series":"btc-updown-5m","source":"chainlink"},"price":110000.0,"size":0.0,"side":"ORACLE","outcome":"btc/usd","receive_lag_ms":10}}
+"#,
+    )
+    .expect("write reference ndjson");
+
+    let response =
+        regime_service::build_router_with_live_dashboard_paths(market_path, reference_path)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dashboard/snapshot")
+                    .body(Body::empty())
+                    .expect("snapshot request"),
+            )
+            .await
+            .expect("snapshot response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("snapshot body");
+    let payload: Value = serde_json::from_slice(&body).expect("snapshot json");
+
+    assert_eq!(payload["market"]["slug"], "btc-updown-5m-current");
+    assert_eq!(payload["regime"]["state"], "WAITING_LIVE_CLOB");
+    assert_eq!(payload["price_points"].as_array().unwrap().len(), 0);
+    assert_eq!(payload["regime_indicators"][0]["key"], "fair_gap");
+    assert_eq!(payload["regime_indicators"][0]["value"], 0.0);
+}
+
+#[tokio::test]
+async fn dashboard_snapshot_endpoint_switches_to_reference_slug_after_market_boundary() {
+    let temp_dir = tempfile::tempdir().expect("live dashboard temp dir");
+    let market_path = temp_dir.path().join("live.market.ndjson");
+    let reference_path = temp_dir.path().join("live.reference.ndjson");
+    fs::write(
+        &market_path,
+        r#"{"kind":"market_tick","record":{"timestamp_ms":1779493999000,"meta":{"slug":"btc-updown-5m-old","series":"btc-updown-5m","source":"clob"},"price":0.91,"size":0.0,"side":"BBA","outcome":"Up","receive_lag_ms":25}}
+"#,
+    )
+    .expect("write market ndjson");
+    fs::write(
+        &reference_path,
+        r#"{"kind":"market_tick","record":{"timestamp_ms":1779494300100,"meta":{"slug":"btc-updown-5m-current","series":"btc-updown-5m","source":"chainlink"},"price":110000.0,"size":0.0,"side":"ORACLE","outcome":"btc/usd","receive_lag_ms":10}}
+"#,
+    )
+    .expect("write reference ndjson");
+
+    let response =
+        regime_service::build_router_with_live_dashboard_paths(market_path, reference_path)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dashboard/snapshot")
+                    .body(Body::empty())
+                    .expect("snapshot request"),
+            )
+            .await
+            .expect("snapshot response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("snapshot body");
+    let payload: Value = serde_json::from_slice(&body).expect("snapshot json");
+
+    assert_eq!(payload["market"]["slug"], "btc-updown-5m-current");
+    assert_eq!(payload["regime"]["state"], "WAITING_LIVE_CLOB");
+    assert_eq!(payload["price_points"].as_array().unwrap().len(), 0);
+    assert_eq!(payload["regime_indicators"][0]["key"], "fair_gap");
+    assert_eq!(payload["regime_indicators"][0]["value"], 0.0);
+}
+
+#[tokio::test]
+async fn dashboard_snapshot_endpoint_resets_when_latest_numeric_market_window_expired() {
+    let temp_dir = tempfile::tempdir().expect("live dashboard temp dir");
+    let market_path = temp_dir.path().join("live.market.ndjson");
+    let reference_path = temp_dir.path().join("live.reference.ndjson");
+    let now_s = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_secs() as i64;
+    let current_start_s = now_s - now_s.rem_euclid(300);
+    let expired_start_s = current_start_s - 300;
+    let expired_slug = format!("btc-updown-5m-{expired_start_s}");
+    let current_slug = format!("btc-updown-5m-{current_start_s}");
+    fs::write(
+        &market_path,
+        format!(
+            r#"{{"kind":"market_tick","record":{{"timestamp_ms":{},"meta":{{"slug":"{}","series":"btc-updown-5m","source":"clob"}},"price":0.91,"size":0.0,"side":"BBA","outcome":"Up","receive_lag_ms":25}}}}
+"#,
+            (expired_start_s + 10) * 1_000,
+            expired_slug
+        ),
+    )
+    .expect("write market ndjson");
+    fs::write(&reference_path, "").expect("write reference ndjson");
+
+    let response =
+        regime_service::build_router_with_live_dashboard_paths(market_path, reference_path)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dashboard/snapshot")
+                    .body(Body::empty())
+                    .expect("snapshot request"),
+            )
+            .await
+            .expect("snapshot response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("snapshot body");
+    let payload: Value = serde_json::from_slice(&body).expect("snapshot json");
+
+    assert_eq!(payload["market"]["slug"], current_slug);
+    assert_eq!(payload["regime"]["state"], "WAITING_LIVE_CLOB");
+    assert_eq!(payload["price_points"].as_array().unwrap().len(), 0);
+    assert!(payload["regime"]["updated_at_ms"].as_i64().unwrap() >= current_start_s * 1_000);
 }
 
 #[tokio::test]

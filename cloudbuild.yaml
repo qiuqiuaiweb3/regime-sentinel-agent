@@ -43,9 +43,10 @@ steps:
       - --memory=1Gi
       - --min-instances=1
       - --max-instances=1
+      - --no-cpu-throttling
       - --concurrency=80
       - --timeout=3600s
-      - --set-env-vars=GOOGLE_CLOUD_PROJECT=$PROJECT_ID,GOOGLE_CLOUD_REGION=${_REGION},SERVICE_PUBLIC_URL=https://regime-sentinel-agent-998092298764.asia-northeast3.run.app,LIVE_COLLECTOR_ENABLED=false,GEMINI_ENABLED=true,GEMINI_PROVIDER=vertex,GEMINI_LOCATION=${_REGION},GEMINI_SUMMARY_INTERVAL_MINUTES=30,GEMINI_MAX_CALLS_PER_HOUR=2,REGIME_STATIC_DIR=/app/build,AGENT_TOOL_MONGODB_TIMEOUT_MS=1500
+      - --set-env-vars=GOOGLE_CLOUD_PROJECT=$PROJECT_ID,GOOGLE_CLOUD_REGION=${_REGION},SERVICE_PUBLIC_URL=https://regime-sentinel-agent-998092298764.asia-northeast3.run.app,LIVE_COLLECTOR_ENABLED=true,LIVE_MARKET_SLUG=auto,LIVE_MARKET_SERIES=btc-updown-5m,LIVE_COLLECTOR_NDJSON_PATH=/tmp/live-fallback.ndjson,REFERENCE_PRICE_SYMBOL=btc/usd,GEMINI_ENABLED=true,GEMINI_PROVIDER=vertex,GEMINI_LOCATION=${_REGION},GEMINI_SUMMARY_INTERVAL_MINUTES=30,GEMINI_MAX_CALLS_PER_HOUR=2,REGIME_STATIC_DIR=/app/build,AGENT_TOOL_MONGODB_TIMEOUT_MS=1500
       - --set-secrets=MONGODB_URI=mongodb-uri:latest,MONGODB_DB=mongodb-db:latest
 
 images:

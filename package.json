@@ -11,7 +11,7 @@
   },
   "dependencies": {
     "@lucide/svelte": "1.16.0",
-    "lightweight-charts": "4.2.3"
+    "uplot": "^1.6.32"
   },
   "devDependencies": {
     "@sveltejs/adapter-static": "3.0.10",

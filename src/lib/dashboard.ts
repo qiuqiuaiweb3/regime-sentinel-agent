@@ -1,5 +1,3 @@
-import type { LineData, SeriesMarker, UTCTimestamp } from 'lightweight-charts';
-
 export type DashboardRegime = {
   state: string;
   confidence: string;
@@ -67,6 +65,9 @@ export type DashboardValidation = {
   reason: string;
   horizons: DashboardValidationHorizon[];
 };
+
+export const LIVE_DASHBOARD_REFRESH_MS = 1_000;
+const POLYMARKET_FIVE_MINUTE_WINDOW_SECONDS = 300;
 
 export type ManualExplainResponse = {
   status: string;
@@ -355,11 +356,32 @@ export type ManualExplainView = {
 
 export type ShiftForecastLabel = 'LIKELY SHIFT' | 'WATCH' | 'STABLE' | 'NO SIGNAL';
 export type DashboardStateTone = 'risk' | 'warn' | 'ok' | 'neutral';
+export type ChartPoint = {
+  time: number;
+  value: number;
+};
+export type ChartMarker = {
+  time: number;
+  color: string;
+  text: string;
+  state: string;
+  score: number;
+};
+export type MarketWindow = {
+  startTime: number;
+  endTime: number;
+};
+export type DashboardChartData = [number[], Array<number | null>, number[]];
 
 export type DashboardView = {
-  priceData: LineData<UTCTimestamp>[];
-  fairData: LineData<UTCTimestamp>[];
-  markers: SeriesMarker<UTCTimestamp>[];
+  priceData: ChartPoint[];
+  fairData: ChartPoint[];
+  hasMidpointData: boolean;
+  marketWindowStatusTitle: string;
+  marketWindowStatusDetail: string;
+  fairLineLabel: string;
+  markers: ChartMarker[];
+  marketWindow: MarketWindow | null;
   alertRows: AlertRow[];
   similarRows: SimilarWindowRow[];
   indicatorRows: IndicatorRow[];
@@ -370,6 +392,7 @@ export type DashboardView = {
   marketSlug: string;
   marketSeries: string;
   marketTitle: string;
+  headerMarketLabel: string;
   state: string;
   confidence: string;
   regimeDescription: string;
@@ -563,17 +586,44 @@ export function snapshotToDashboardView(
   nowMs: number = Date.now()
 ): DashboardView {
   const baseTimestamp = snapshot.price_points[0]?.timestamp_ms ?? snapshot.regime.updated_at_ms;
+  const marketWindow = marketWindowFromSlug(snapshot.market.slug);
   const shiftScoreRaw =
     snapshot.regime_indicators.find((indicator) => indicator.key === 'shift_score')?.value ?? null;
-  const shiftScoreClamped =
+  const rawShiftScoreClamped =
     shiftScoreRaw === null ? null : Math.min(Math.max(shiftScoreRaw, 0), 1);
+  const hasMidpointData = snapshot.price_points.length > 0;
+  const waitingForLiveClob = snapshot.regime.state === 'WAITING_LIVE_CLOB' && !hasMidpointData;
+  const shiftScoreClamped = waitingForLiveClob ? null : rawShiftScoreClamped;
   const shiftForecastLabel = forecastLabelFromScore(shiftScoreClamped);
-  const stateTone = stateToneFromSnapshot(snapshot.regime.state, shiftScoreClamped);
+  const stateTone = waitingForLiveClob
+    ? 'neutral'
+    : stateToneFromSnapshot(snapshot.regime.state, shiftScoreClamped);
   const sourceRegimeLabel = snapshot.regime.state;
   const displayRegimeLabel =
-    sourceRegimeLabel === 'EARLY_RISK' && shiftScoreClamped !== null && shiftScoreClamped >= 0.75
-      ? 'SHIFT_RISK'
-      : sourceRegimeLabel;
+    waitingForLiveClob
+      ? 'WAITING CLOB'
+      : sourceRegimeLabel === 'EARLY_RISK' &&
+          shiftScoreClamped !== null &&
+          shiftScoreClamped >= 0.75
+        ? 'SHIFT_RISK'
+        : sourceRegimeLabel;
+  const latestMidpoint = snapshot.price_points.at(-1);
+  const latestMidpointAge =
+    latestMidpoint === undefined ? null : formatSampleAge(nowMs - latestMidpoint.timestamp_ms);
+  const marketWindowStatusTitle = hasMidpointData ? 'LIVE P_MID ACTIVE' : 'WAITING FOR P_MID';
+  const marketWindowStatusDetail = !hasMidpointData
+    ? `No Polymarket Up midpoint samples for ${snapshot.market.slug} yet. The chart refreshes every second and will draw the current 5m market after the first p_mid tick.`
+    : `${snapshot.price_points.length} Polymarket Up midpoint sample${
+        snapshot.price_points.length === 1 ? '' : 's'
+      } in the active 5m market; last p_mid ${latestMidpointAge} ago.`;
+  const fairLineLabel = hasMidpointData ? 'p_fair' : 'p_fair neutral baseline';
+  const indicatorRows = snapshot.regime_indicators.map((indicator) => ({
+    key: indicator.key,
+    label: indicator.label,
+    value: formatIndicatorValue(indicator.value, indicator.unit),
+    status: waitingForLiveClob ? 'waiting' : indicator.status,
+    description: indicator.description
+  }));
 
   return {
     priceData: snapshot.price_points.map((point) => ({
@@ -584,13 +634,18 @@ export function snapshotToDashboardView(
       time: toChartTime(point.timestamp_ms),
       value: point.p_fair
     })),
+    hasMidpointData,
+    marketWindowStatusTitle,
+    marketWindowStatusDetail,
+    fairLineLabel,
     markers: snapshot.alerts.map((alert) => ({
       time: toChartTime(alert.timestamp_ms),
-      position: 'aboveBar',
       color: '#b91c1c',
-      shape: 'arrowDown',
-      text: `${alert.state} ${formatLeadTime(alert.lead_time_ms, false)}`
+      text: `${alert.state} ${formatLeadTime(alert.lead_time_ms, false)}`,
+      state: alert.state,
+      score: alert.score
     })),
+    marketWindow,
     alertRows: snapshot.alerts.map((alert) => ({
       time: formatRelativeTime(alert.timestamp_ms, baseTimestamp),
       state: alert.state,
@@ -605,13 +660,7 @@ export function snapshotToDashboardView(
       orderFlow: window.ofi_1s.toFixed(3),
       depth: window.depth_imbalance.toFixed(3)
     })),
-    indicatorRows: snapshot.regime_indicators.map((indicator) => ({
-      key: indicator.key,
-      label: indicator.label,
-      value: formatIndicatorValue(indicator.value, indicator.unit),
-      status: indicator.status,
-      description: indicator.description
-    })),
+    indicatorRows,
     formulaRows: formulaRows(snapshot),
     stateFormula:
       'shift_score = clamp(|fair_gap| * 2 + |mid_velocity_1s| * 4 + |order_flow_1s| * 0.4 + min(|btc_velocity_1s| / 100, 0.3), 0, 1)',
@@ -628,6 +677,7 @@ export function snapshotToDashboardView(
     marketSlug: snapshot.market.slug,
     marketSeries: snapshot.market.series,
     marketTitle: snapshot.market.title,
+    headerMarketLabel: snapshot.market.slug,
     state: snapshot.regime.state,
     confidence: snapshot.regime.confidence,
     regimeDescription: snapshot.regime.description,
@@ -656,6 +706,42 @@ export function snapshotToDashboardView(
       3
     )} · recall ${snapshot.validation.recall.toFixed(3)}`
   };
+}
+
+export function marketWindowFromSlug(slug: string): MarketWindow | null {
+  const match = slug.match(/-(\d{10})$/);
+  if (!match) {
+    return null;
+  }
+
+  const startTime = Number(match[1]);
+  if (!Number.isSafeInteger(startTime)) {
+    return null;
+  }
+
+  return {
+    startTime,
+    endTime: startTime + POLYMARKET_FIVE_MINUTE_WINDOW_SECONDS
+  };
+}
+
+export function dashboardChartDataFromView(view: DashboardView): DashboardChartData {
+  const times = new Set(view.priceData.map((point) => point.time));
+  if (view.marketWindow) {
+    times.add(view.marketWindow.startTime);
+    times.add(view.marketWindow.endTime);
+  }
+
+  const sortedTimes = [...times].sort((left, right) => left - right);
+  const pMidByTime = new Map(view.priceData.map((point) => [point.time, point.value]));
+  const fairByTime = new Map(view.fairData.map((point) => [point.time, point.value]));
+  const fairFallback = view.fairData.at(-1)?.value ?? 0.5;
+
+  return [
+    sortedTimes,
+    sortedTimes.map((time) => pMidByTime.get(time) ?? null),
+    sortedTimes.map((time) => fairByTime.get(time) ?? fairFallback)
+  ];
 }
 
 export function formatGeminiCountdown(nextUpdateAtMs: number | null, nowMs: number): string {
@@ -790,14 +876,27 @@ export function manualExplainErrorToView(error: unknown): ManualExplainView {
   };
 }
 
-function toChartTime(timestampMs: number): UTCTimestamp {
-  return (timestampMs / 1000) as UTCTimestamp;
+function toChartTime(timestampMs: number): number {
+  return timestampMs / 1000;
 }
 
 function formatRelativeTime(timestampMs: number, baseTimestampMs: number): string {
   const deltaSeconds = (timestampMs - baseTimestampMs) / 1000;
   const sign = deltaSeconds >= 0 ? '+' : '-';
   return `${sign}${Math.abs(deltaSeconds).toFixed(3)}s`;
+}
+
+function formatSampleAge(ageMs: number): string {
+  const seconds = Math.max(0, ageMs) / 1000;
+  if (seconds < 10) {
+    return `${seconds.toFixed(1)}s`;
+  }
+  if (seconds < 60) {
+    return `${Math.round(seconds)}s`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  const remainderSeconds = Math.round(seconds % 60);
+  return `${minutes}m ${remainderSeconds}s`;
 }
 
 function formatLeadTime(leadTimeMs: number, withSpace: boolean): string {

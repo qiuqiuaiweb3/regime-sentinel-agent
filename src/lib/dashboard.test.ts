@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  LIVE_DASHBOARD_REFRESH_MS,
+  dashboardChartDataFromView,
   dashboardRunStateForSnapshot,
   fallbackDashboardSnapshot,
   fetchDashboardSnapshot,
@@ -8,6 +10,7 @@ import {
   formatGeminiCountdown,
   manualExplainErrorToView,
   manualExplainResponseToView,
+  marketWindowFromSlug,
   normalizeDashboardSnapshot,
   requestManualExplain,
   snapshotToDashboardView,
@@ -129,6 +132,10 @@ describe('snapshotToDashboardView', () => {
   it('converts the service snapshot into chart series and alert rows', () => {
     const view = snapshotToDashboardView(snapshot, 1_769_000_001_000);
 
+    expect(view.marketWindow).toEqual({
+      startTime: 1_769_000_000,
+      endTime: 1_769_000_300
+    });
     expect(view.priceData).toEqual([
       { time: 1_769_000_000, value: 0.5 },
       { time: 1_769_000_000.75, value: 0.54 }
@@ -140,10 +147,10 @@ describe('snapshotToDashboardView', () => {
     expect(view.markers).toEqual([
       {
         time: 1_769_000_000.75,
-        position: 'aboveBar',
         color: '#b91c1c',
-        shape: 'arrowDown',
-        text: 'EARLY_RISK +250ms'
+        text: 'EARLY_RISK +250ms',
+        state: 'EARLY_RISK',
+        score: 1.94
       }
     ]);
     expect(view.alertRows).toEqual([
@@ -156,6 +163,7 @@ describe('snapshotToDashboardView', () => {
     ]);
     expect(view.currentLead).toBe('+250 ms');
     expect(view.marketSlug).toBe('btc-updown-5m-1769000000');
+    expect(view.headerMarketLabel).toBe('btc-updown-5m-1769000000');
     expect(view.marketTitle).toBe('Bitcoin Up or Down - demo');
     expect(view.regimeDescription).toBe('Up-side pressure is rising before full repricing.');
     expect(view.indicatorRows).toEqual([
@@ -318,6 +326,76 @@ describe('snapshotToDashboardView', () => {
     expect(view.similarRows).toEqual([]);
     expect(view.validationRows).toEqual([]);
     expect(view.validationSummary).toBe('median pending · p75 pending · precision 0.000 · recall 0.000');
+  });
+
+  it('derives fixed five-minute market windows from Polymarket slugs', () => {
+    expect(marketWindowFromSlug('btc-updown-5m-1769000000')).toEqual({
+      startTime: 1_769_000_000,
+      endTime: 1_769_000_300
+    });
+    expect(marketWindowFromSlug('unknown-market')).toBeNull();
+    expect(LIVE_DASHBOARD_REFRESH_MS).toBe(1_000);
+  });
+
+  it('aligns market-window chart data to the active five-minute window', () => {
+    const view = snapshotToDashboardView({
+      ...snapshot,
+      price_points: [{ timestamp_ms: 1_769_000_001_000, p_mid: 0.52, p_fair: 0.5 }],
+      alerts: []
+    });
+
+    expect(dashboardChartDataFromView(view)).toEqual([
+      [1_769_000_000, 1_769_000_001, 1_769_000_300],
+      [null, 0.52, null],
+      [0.5, 0.5, 0.5]
+    ]);
+  });
+
+  it('keeps sample freshness visible when only one live midpoint sample exists', () => {
+    const view = snapshotToDashboardView(
+      {
+        ...snapshot,
+        price_points: [{ timestamp_ms: 1_769_000_001_000, p_mid: 0.52, p_fair: 0.5 }]
+      },
+      1_769_000_006_500
+    );
+
+    expect(view.marketWindowStatusTitle).toBe('LIVE P_MID ACTIVE');
+    expect(view.marketWindowStatusDetail).toContain('1 Polymarket Up midpoint sample');
+    expect(view.marketWindowStatusDetail).toContain('last p_mid 5.5s ago');
+  });
+
+  it('shows an explicit waiting state when the live CLOB midpoint has not arrived', () => {
+    const view = snapshotToDashboardView({
+      ...snapshot,
+      regime: {
+        state: 'WAITING_LIVE_CLOB',
+        confidence: 'Low',
+        updated_at_ms: 1_769_000_001_000,
+        description:
+          'Live collector is connected to the current window, but no Polymarket Up midpoint tick has been received yet.'
+      },
+      price_points: [],
+      alerts: [],
+      regime_indicators: snapshot.regime_indicators.map((indicator) => ({
+        ...indicator,
+        value: 0,
+        status: 'normal'
+      }))
+    });
+
+    expect(view.hasMidpointData).toBe(false);
+    expect(view.shiftForecastLabel).toBe('NO SIGNAL');
+    expect(view.stateTone).toBe('neutral');
+    expect(view.marketWindowStatusTitle).toBe('WAITING FOR P_MID');
+    expect(view.marketWindowStatusDetail).toContain('No Polymarket Up midpoint samples');
+    expect(view.fairLineLabel).toBe('p_fair neutral baseline');
+    expect(view.indicatorRows.map((row) => row.status)).toEqual(['waiting', 'waiting']);
+    expect(dashboardChartDataFromView(view)).toEqual([
+      [1_769_000_000, 1_769_000_300],
+      [null, null],
+      [0.5, 0.5]
+    ]);
   });
 
   it('formats scheduled Gemini countdowns from the next update timestamp', () => {
